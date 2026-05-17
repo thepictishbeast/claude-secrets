@@ -1,0 +1,11 @@
+# NEVER COMMIT the local secrets vault
+.claude-secrets/
+~/.claude-secrets/
+
+# Test scratch
+/tmp/claude-secrets-test-*
+
+# Editor
+*.swp
+*.swo
+.DS_Store
