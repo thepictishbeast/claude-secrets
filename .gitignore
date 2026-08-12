@@ -9,3 +9,6 @@
 *.swp
 *.swo
 .DS_Store
+
+# agent onboarding kept local-only (cruft standard)
+CLAUDE.md
