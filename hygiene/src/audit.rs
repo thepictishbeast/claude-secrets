@@ -83,6 +83,28 @@ impl Config {
     }
 }
 
+/// Whether `pattern` (a path whose LAST component may hold one `*`) names
+/// `path`. The one matcher behind both `expand` and pruning, so what a scan
+/// looks at and what it may forget cannot disagree.
+fn names(pattern: &str, path: &Path) -> bool {
+    let p = Path::new(pattern);
+    if p.parent() != path.parent() {
+        return false;
+    }
+    let (Some(want), Some(got)) = (
+        p.file_name().and_then(|n| n.to_str()),
+        path.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return false;
+    };
+    match want.split_once('*') {
+        None => got == want,
+        Some((pre, post)) => {
+            got.len() >= pre.len() + post.len() && got.starts_with(pre) && got.ends_with(post)
+        }
+    }
+}
+
 /// Expand a path whose LAST component may contain one `*`.
 #[must_use]
 pub fn expand(pattern: &str) -> Vec<PathBuf> {
@@ -95,7 +117,6 @@ pub fn expand(pattern: &str) -> Vec<PathBuf> {
             Vec::new()
         };
     }
-    let (pre, post) = name.split_once('*').unwrap_or((name, ""));
     let dir = p.parent().unwrap_or(Path::new("/"));
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -103,15 +124,28 @@ pub fn expand(pattern: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = rd
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|path| {
-            path.is_file()
-                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with(pre) && n.ends_with(post) && n.len() >= pre.len() + post.len()
-                })
-        })
+        .filter(|path| path.is_file() && names(pattern, path))
         .collect();
     out.sort();
     out
+}
+
+/// Whether this run could actually look where `pattern` points.
+///
+/// "Matched nothing" alone cannot tell a deleted file from a place that
+/// is not there right now. The directory can: absent or unreadable means a
+/// pool still locked at boot; EMPTY means an unmounted dataset's bare
+/// mountpoint. A directory holding other files, but not this one, means the
+/// file really is gone.
+fn could_look(pattern: &str) -> bool {
+    let dir = Path::new(pattern).parent().unwrap_or(Path::new("/"));
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// `(kind word, file path)` of a location such as `env:/p/.env#KEY`.
+fn location_file(loc: &str) -> Option<(&str, &Path)> {
+    let (kind, rest) = loc.split_once(':')?;
+    Some((kind, Path::new(rest.split('#').next()?)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,11 +234,15 @@ pub fn run(cfg: &Config, pepper: &Pepper, state: &mut State, now: u64) -> Outcom
     let mut blind = Vec::new();
     let mut ambiguous = BTreeSet::new();
     let mut coverage = Vec::new();
+    let mut unseen: Vec<(&str, &str)> = Vec::new();
 
     for (kind, pattern) in &cfg.sources {
         let source = format!("{} {pattern}", kind_word(kind));
         let files = expand(pattern);
         if files.is_empty() {
+            if !could_look(pattern) {
+                unseen.push((kind_word(kind), pattern));
+            }
             blind.push(Finding::Uncovered {
                 source: source.clone(),
             });
@@ -266,7 +304,18 @@ pub fn run(cfg: &Config, pepper: &Pepper, state: &mut State, now: u64) -> Outcom
             empty,
         });
     }
-    state.retain(&present);
+    // Forget locations that are really gone -- but only where this run could
+    // look. A source that matched nothing (a pool not yet unlocked at boot)
+    // says nothing about what it holds: its locations keep their history,
+    // or one reboot would silently restart every age this tool tracks.
+    let under_unseen = |loc: &str| {
+        location_file(loc).is_some_and(|(k, path)| {
+            unseen
+                .iter()
+                .any(|(uk, pattern)| *uk == k && names(pattern, path))
+        })
+    };
+    state.retain(|loc| present.contains(loc) || under_unseen(loc));
     blind.extend(
         ambiguous
             .into_iter()
@@ -296,6 +345,9 @@ pub fn run(cfg: &Config, pepper: &Pepper, state: &mut State, now: u64) -> Outcom
         for l in group {
             match fp_at.get(l) {
                 Some(fp) => copies.push((pepper.label(fp), l.clone())),
+                // Under a blind source it is unseen, not missing; the BLIND
+                // line already says so.
+                None if under_unseen(l) => {}
                 None => blind.push(Finding::Missing {
                     location: l.clone(),
                 }),
@@ -635,6 +687,55 @@ mod tests {
                 .any(|x| matches!(x, Finding::Stale { location, .. } if *location == loc)),
             "40 days after a rotation is not stale"
         );
+    }
+
+    #[test]
+    fn a_source_that_is_unavailable_keeps_its_history() {
+        // /tank is unlocked by hand after a reboot, and the timer's catch-up
+        // run fires at boot, before that. Nothing under it can be seen, and
+        // "cannot see" must not be recorded as "deleted": pruning there would
+        // silently restart every age the tool exists to track.
+        let f = fixture("unmounted");
+        let [a, b, c] = shared_locations(&f);
+        let cfg = cfg_with(&f, &format!("same {a} {b} {c}\n"));
+        let p = Pepper::from_bytes(&[18; 32]);
+        let mut st = State::default();
+        let t0 = now();
+        run(&cfg, &p, &mut st, t0);
+        let before = st.entries.clone();
+        assert!(!before.is_empty());
+
+        // A pool not yet imported: nothing there at all.
+        let away = f.dir.with_extension("away");
+        std::fs::rename(&f.dir, &away).unwrap();
+        let o = run(&cfg, &p, &mut st, t0 + DAY);
+        // A dataset not yet mounted: an empty mountpoint left behind.
+        std::fs::create_dir(&f.dir).unwrap();
+        run(&cfg, &p, &mut st, t0 + DAY);
+        let after_empty_mountpoint = st.entries.clone();
+        std::fs::remove_dir(&f.dir).unwrap();
+        std::fs::rename(&away, &f.dir).unwrap();
+        assert_eq!(
+            after_empty_mountpoint, before,
+            "an empty mountpoint is not a deletion"
+        );
+        assert!(o
+            .findings
+            .iter()
+            .any(|x| matches!(x, Finding::Uncovered { .. })));
+        assert!(
+            !o.findings
+                .iter()
+                .any(|x| matches!(x, Finding::Missing { .. })),
+            "unseen is not missing: {:?}",
+            o.findings
+        );
+        assert_eq!(st.entries, before, "history kept while its source is blind");
+
+        run(&cfg, &p, &mut st, t0 + 2 * DAY);
+        for (loc, e) in &before {
+            assert_eq!(st.entries[loc].since, e.since, "{loc}: age continues");
+        }
     }
 
     #[test]

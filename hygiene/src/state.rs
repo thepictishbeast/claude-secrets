@@ -82,10 +82,11 @@ impl State {
         entry
     }
 
-    /// Forget locations that no longer hold a secret, so a deleted file
-    /// stops being reported and its old fingerprint stops lingering.
-    pub fn retain(&mut self, present: &std::collections::BTreeSet<String>) {
-        self.entries.retain(|k, _| present.contains(k));
+    /// Keep only the locations `keep` accepts. The caller decides what is
+    /// really gone: a deleted file should stop lingering, but a location
+    /// that simply could not be seen this run must keep its history.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.entries.retain(|k, _| keep(k));
     }
 
     /// Write atomically, owner-only.
