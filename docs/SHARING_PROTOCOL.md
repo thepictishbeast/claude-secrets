@@ -15,7 +15,7 @@ my github PAT is github_pat_11ABCDEFGHIJ
 the hetzner password is hunter2-and-some-more-bits
 ssh privkey:
 -----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAA...
+<key material, many lines of base64>
 -----END OPENSSH PRIVATE KEY-----
 ```
 
