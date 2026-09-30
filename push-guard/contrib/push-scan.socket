@@ -1,0 +1,15 @@
+[Unit]
+Description=Known-credential scan for git pushes (socket)
+
+[Socket]
+# One connection per push. Only root and the paul group can connect; the
+# service answers with counts and credential labels, never a value.
+ListenStream=/run/push-scan.sock
+SocketUser=root
+SocketGroup=paul
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

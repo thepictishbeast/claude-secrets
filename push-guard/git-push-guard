@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# git-push-guard — refuse a push until its destination's visibility is known
+# and its outgoing commits are clean. Runs as git's pre-push hook:
+#
+#   git-push-guard <remote-name> <remote-url>   (stdin: pre-push ref lines)
+#
+# Every push, private or public, is refused if the outgoing commits contain:
+#   - a known credential, in any leaked form (claude-secrets-hygiene find-in,
+#     reached through the root push-scan socket so paul's pushes are covered)
+#   - anything gitleaks recognises
+#   - a newly added credential-shaped file (.env, private keys, keystores,
+#     databases)
+# A push to a PUBLIC repository is also refused if an added line or a commit
+# message matches /etc/claude-secrets/public-denylist (personal data,
+# internal addresses, credential locations).
+#
+# Visibility comes from the GitHub API. If it cannot be confirmed, the push
+# is refused: an unknown answer is treated as public and unsafe.
+# Output names labels, rules, commits and files, never a matched value.
+#
+# The only way past a refusal is a person running `git push --no-verify`
+# themselves; Claude sessions are denied that flag by their own hook.
+set -uo pipefail
+
+remote="${1:-}"
+url="${2:-}"
+DENYLIST=/etc/claude-secrets/public-denylist
+ALLOW=/etc/claude-secrets/push-allow
+SOCKET=/run/push-scan.sock
+ZERO=0000000000000000000000000000000000000000
+problems=()
+
+say() { printf 'push-guard: %s\n' "$*" >&2; }
+refuse() {
+  say "REFUSED push to ${url}"
+  for p in "${problems[@]}"; do say "  - $p"; done
+  say "Fix the commits (rewrite them if they are unpushed), then push again."
+  exit 1
+}
+
+# ---- 1. Where is this going, and is it public? ----------------------------
+slug=""
+case "$url" in
+  *github.com[:/]*)
+    slug=$(printf '%s' "$url" | sed -E 's#^.*github\.com[:/]+##; s#\.git/?$##; s#/+$##')
+    if ! private=$(gh api "repos/${slug}" --jq '.private' 2>/dev/null); then
+      problems+=("could not confirm whether github.com/${slug} is public or private (gh api failed); refusing rather than guessing")
+      refuse
+    fi
+    case "$private" in
+      true) visibility=private ;;
+      false) visibility=public ;;
+      *) problems+=("unexpected visibility answer for ${slug}"); refuse ;;
+    esac
+    ;;
+  /* | file://* | ./* | ../*)
+    # A path on this machine is private. A test or mirror remote can declare
+    # itself public (stricter), never the other way round.
+    visibility=private
+    [ "$(git config --get push-guard.visibility 2>/dev/null)" = public ] && visibility=public
+    # Tests only: a local remote may name a lab scanner socket and a lab
+    # denylist, so tests never need the real private entries. Nothing that
+    # leaves this machine can use these.
+    lab_socket=$(git config --get push-guard.socket 2>/dev/null) && SOCKET="$lab_socket"
+    lab_deny=$(git config --get push-guard.denylist 2>/dev/null) && DENYLIST="$lab_deny"
+    ;;
+  *)
+    # Any other host: its visibility cannot be checked, so scan as public.
+    visibility=public
+    ;;
+esac
+
+# ---- 2. Which commits are leaving? ----------------------------------------
+revs=()
+while read -r _lref lsha _rref rsha; do
+  [ -z "${lsha:-}" ] && continue
+  [ "$lsha" = "$ZERO" ] && continue # a branch deletion sends no content
+  if [ "$rsha" != "$ZERO" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
+    revs+=("${rsha}..${lsha}")
+  else
+    # New branch, or a remote tip we do not have: everything not already on
+    # this remote. A first push to a new repo sends its whole history.
+    revs+=("$lsha" "--not" "--remotes=${remote}")
+  fi
+done
+[ ${#revs[@]} -eq 0 ] && exit 0
+commits=$(git rev-list "${revs[@]}" 2>/dev/null) || { problems+=("could not list the outgoing commits"); refuse; }
+[ -z "$commits" ] && exit 0
+n=$(printf '%s\n' "$commits" | wc -l)
+say "checking ${n} outgoing commit(s) to ${slug:-$url} (${visibility})"
+
+# Scratch space of our own. TMPDIR may be inherited from another user (a root
+# session running git as paul) and be unwritable; a scan that cannot write
+# its files must refuse the push, never pass it.
+work=$(mktemp -d /tmp/push-guard.XXXXXX 2>/dev/null) || { problems+=("cannot create a scratch directory in /tmp; refusing"); refuse; }
+trap 'rm -rf "$work"' EXIT
+export TMPDIR="$work"
+report="$work/gitleaks.json"
+glog="$work/gitleaks.log"
+added="$work/added.tsv"
+
+patch() { printf '%s\n' "$commits" | git log --no-walk=unsorted --stdin -p --no-color --format='commit %H%n%B'; }
+
+# ---- 3. Known credentials, by value (root scanner over a socket) ---------
+scan=$(patch | python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(120)
+try:
+    s.connect(sys.argv[1])
+except OSError as e:
+    print("CONNECT-FAILED", e); sys.exit(0)
+for chunk in iter(lambda: sys.stdin.buffer.read(65536), b""):
+    s.sendall(chunk)
+s.shutdown(socket.SHUT_WR)
+out = b"".join(iter(lambda: s.recv(65536), b""))
+sys.stdout.write(out.decode(errors="replace"))
+' "$SOCKET")
+summary=$(printf '%s\n' "$scan" | /usr/bin/grep -E 'known credential' | tail -1)
+if [ -z "$summary" ]; then
+  problems+=("the known-credential scan did not run ($(printf '%s' "$scan" | head -c 160 | tr '\n' ' ')); refusing rather than skipping it")
+elif ! printf '%s' "$summary" | /usr/bin/grep -qE ': 0 occurrence'; then
+  labels=$(printf '%s\n' "$scan" | /usr/bin/grep -oE 'cred-[0-9a-f]{6}' | sort -u | tr '\n' ' ')
+  problems+=("known credential(s) in the outgoing commits: ${labels:-see scanner}(rotate them; they are in the diff)")
+fi
+
+# ---- 4. Pattern secrets (gitleaks over exactly these commits) ------------
+# "${revs[*]}" joins with single spaces. A trailing space made gitleaks hand
+# git an empty argument, scan 0 commits and report "no leaks found" with exit
+# 0, so the number of commits it scanned is checked as well as its verdict.
+if ! gitleaks git --no-banner --redact=100 --ignore-gitleaks-allow --max-decode-depth 0 \
+     --log-opts="${revs[*]}" -f json -r "$report" . >/dev/null 2>"$glog"; then
+  if [ -s "$report" ] && jq -e 'length > 0' "$report" >/dev/null 2>&1; then
+    while IFS= read -r line; do problems+=("gitleaks: ${line}"); done < <(jq -r '.[] | "\(.RuleID) in \(.File) (commit \(.Commit[0:8]))"' "$report" | sort -u | head -20)
+  else
+    problems+=("gitleaks could not scan the outgoing commits; refusing rather than skipping it")
+  fi
+fi
+scanned=$(/usr/bin/grep -oE '[0-9]+ commits scanned' "$glog" | /usr/bin/grep -oE '^[0-9]+' | tail -1)
+if [ "${scanned:-0}" -lt "$n" ]; then
+  problems+=("gitleaks scanned ${scanned:-0} of ${n} outgoing commit(s); refusing rather than trusting a partial scan")
+fi
+
+# ---- 5. Credential-shaped files added ------------------------------------
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  case "$f" in *.example | *.sample | *.template | *.pub | *.dist) continue ;; esac
+  problems+=("credential-shaped file added: ${f}")
+done < <(printf '%s\n' "$commits" | git log --no-walk=unsorted --stdin --diff-filter=A --name-only --format='' |
+  /usr/bin/grep -E '(^|/)(\.env(\.[A-Za-z0-9_-]+)?|id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|sqlite3?|db))$' | sort -u)
+
+# ---- 6. Things that must never be public ---------------------------------
+if [ "$visibility" = public ]; then
+  if [ ! -r "$DENYLIST" ]; then
+    problems+=("cannot read ${DENYLIST}, so a public push cannot be checked; refusing")
+  else
+    allowed=""
+    [ -r "$ALLOW" ] && allowed=$(awk -v s="$slug" -F'\t' '$1 == s {print $2}' "$ALLOW")
+    # One row per added line or message line: commit, file, text.
+    for c in $commits; do
+      git show --no-color --unified=0 --format='%B' "$c" | awk -v c="${c:0:8}" '
+        BEGIN { f = "(commit message)"; inmsg = 1 }
+        /^diff --git / { inmsg = 0; next }
+        /^\+\+\+ / { f = substr($0, 5); sub(/^b\//, "", f); next }
+        inmsg { print c "\t" f "\t" $0; next }
+        /^\+/ { print c "\t" f "\t" substr($0, 2) }'
+    done > "$added" || problems+=("could not collect the added lines; refusing")
+    [ -f "$added" ] || problems+=("could not collect the added lines; refusing")
+    while IFS=$'\t' read -r label re; do
+      [ -z "$label" ] || [[ "$label" == \#* ]] && continue
+      printf '%s\n' "$allowed" | /usr/bin/grep -qxF "$label" && continue
+      hits=$(cut -f3- "$added" | /usr/bin/grep -cE "$re")
+      [ "$hits" -eq 0 ] && continue
+      # Locate with grep too: awk's regex dialect reads \b as a backspace.
+      where=$(cut -f3- "$added" | /usr/bin/grep -nE "$re" | cut -d: -f1 | head -50 |
+        while read -r ln; do sed -n "${ln}p" "$added" | cut -f1,2 | tr '\t' ' '; done | sort -u | head -5 | tr '\n' ';')
+      problems+=("${label}: ${hits} line(s) — ${where:-see commits}")
+    done < "$DENYLIST"
+  fi
+fi
+
+[ ${#problems[@]} -gt 0 ] && refuse
+say "ok: ${n} commit(s), ${visibility}, no known credentials, no gitleaks findings$([ "$visibility" = public ] && printf ', no denylisted content')"
+exit 0

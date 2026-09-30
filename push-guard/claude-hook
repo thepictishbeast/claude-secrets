@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Claude Code PreToolUse hook (matcher: Bash). The git pre-push guard checks
+# every push; this hook stops a session from routing around it, and from
+# making anything public on its own:
+#   - `git push --no-verify` (skips the guard)
+#   - any git command that touches core.hooksPath (disables the guard)
+#   - creating a public repo, making a repo public, a public gist, or writing
+#     files through the GitHub contents API (commits that bypass git hooks)
+# Each of these is Paul's decision: the session is told to ask him.
+set -uo pipefail
+cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null)
+[ -z "$cmd" ] && exit 0
+flat=$(printf '%s' "$cmd" | tr '\n' ' ' | tr -s ' ')
+
+deny() {
+  jq -cn --arg r "push-guard: $1 Ask Paul; he can do it himself if he wants it." \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
+  exit 0
+}
+
+is_git_push() { printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])git( +(-C|-c) +[^ ]+| +--[a-z-]+(=[^ ]+)?)* +push( |$)'; }
+
+if is_git_push && printf '%s' "$flat" | /usr/bin/grep -qE '(^| )--no-verify( |$)'; then
+  deny "\`git push --no-verify\` skips the check that keeps secrets and private data out of pushes."
+fi
+# Setting or removing core.hooksPath (never reading or mentioning it): the -c
+# form, `git config` writes and unsets, and the environment-variable forms.
+if printf '%s' "$flat" | /usr/bin/grep -qiE '(^|[;&|( ])git( +[^;&|]*)? -c +core\.hookspath=' ||
+   printf '%s' "$flat" | /usr/bin/grep -iE '(^|[;&|( ])git( +[^;&|]*)? config( +[^;&|]*)? core\.hookspath' |
+     /usr/bin/grep -qviE 'config( +--(global|system|local|worktree|file[= ][^ ]+))* +--get(-all|-regexp)? +core\.hookspath' ||
+   printf '%s' "$flat" | /usr/bin/grep -qiE 'GIT_CONFIG_(PARAMETERS|KEY_[0-9]+)=[^ ]*hookspath'; then
+  deny "changing core.hooksPath would disable the push guard."
+fi
+if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +repo +create( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE '(^| )--public( |$)'; then
+  deny "creating a PUBLIC repository is Paul's decision."
+fi
+if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +repo +edit( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE -- '--visibility[= ]+public'; then
+  deny "making a repository public is Paul's decision."
+fi
+if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +api( |$)' &&
+   printf '%s' "$flat" | /usr/bin/grep -qiE '(private[=:]+ *"?false|visibility[=:]+ *"?public)'; then
+  deny "changing a repository to public through the API is Paul's decision."
+fi
+if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +gist +create( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE '(^| )(--public|-p)( |$)'; then
+  deny "a public gist publishes content without any check."
+fi
+if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +api( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE '/contents/' &&
+   printf '%s' "$flat" | /usr/bin/grep -qiE '(-X|--method) *(PUT|POST|PATCH|DELETE)'; then
+  deny "writing files through the GitHub contents API makes commits that skip the push guard; use git."
+fi
+exit 0

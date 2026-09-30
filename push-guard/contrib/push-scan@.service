@@ -1,0 +1,20 @@
+[Unit]
+Description=Known-credential scan of one outgoing push
+# Credential sources live on /tank, which is locked after a reboot. Then the
+# scanner exits 2 ("cannot vouch") and the push is refused, as it should be.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claude-secrets-hygiene find-in -
+StandardInput=socket
+StandardOutput=socket
+StandardError=socket
+# Reads the dictionary; writes nothing; no network.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+MemoryMax=512M
+RuntimeMaxSec=120
+Nice=5

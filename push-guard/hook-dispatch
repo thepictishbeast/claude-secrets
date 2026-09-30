@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Installed once per git hook name in the system-wide core.hooksPath. It runs
+# git-push-guard for pre-push, then hands every hook to the repository's own
+# hook if it has one, so repo hooks (stop-the-line's pre-commit and the like)
+# keep working exactly as before.
+hook=$(basename "$0")
+if [ "$hook" = pre-push ]; then
+  # pre-push gets the ref lines on stdin: keep a copy for the repo's own hook.
+  input=$(cat)
+  printf '%s\n' "$input" | /usr/local/bin/git-push-guard "$@" || exit 1
+  own="$(git rev-parse --git-common-dir)/hooks/$hook"
+  if [ -x "$own" ]; then printf '%s\n' "$input" | exec "$own" "$@"; fi
+  exit 0
+fi
+own="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/$hook"
+[ -x "$own" ] && exec "$own" "$@"
+exit 0
