@@ -58,3 +58,9 @@ sessions are denied that flag.
   one.** None did on 2026-09-30.
 - **A credential that is neither known nor shaped like one can't be caught.**
   Keep the credential sources in `hygiene.conf` complete.
+- **The Claude hook reads command text, so it is a tripwire, not a wall.** A
+  command written to a script file and then run isn't seen. Neither is a root
+  session editing `/etc/gitconfig` or the files under
+  `/usr/local/lib/git-guard/` directly, nor `git config --edit` with an editor
+  of its choosing. Stopping those would take file permissions, not pattern
+  matching.
