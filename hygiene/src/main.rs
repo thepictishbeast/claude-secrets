@@ -4,11 +4,17 @@
 //!   claude-secrets-hygiene init              create the pepper (once)
 //!   claude-secrets-hygiene scan [--notify A] update history, write the report
 //!   claude-secrets-hygiene check             same audit, read-only
+//!   claude-secrets-hygiene find-in PATH...   count known credentials in files
+//!   claude-secrets-hygiene redact-in PATH... replace them, in place
+//!
+//! `find-in` reads directories recursively, `.gz` files through gzip, and
+//! `-` as stdin. Both name a credential only by its report label.
 //!
 //! Exit status: 0 nothing found, 1 findings, 2 could not run.
 
 use claude_secrets_hygiene::audit::{render, run, Config, Finding};
 use claude_secrets_hygiene::fingerprint::Pepper;
+use claude_secrets_hygiene::known::{Dictionary, MIN_LEN};
 use claude_secrets_hygiene::state::State;
 use claude_secrets_hygiene::ymd;
 use sha2::{Digest, Sha256};
@@ -84,11 +90,212 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "labels" => {
+            // Which location each label stands for, and the SHAPE of the
+            // secret (length, character classes) -- enough to judge whether a
+            // value is too common to search for, without showing it.
+            let cfg_path = flag(&args, "--config", CONFIG);
+            let pepper = Pepper::load(&pepper_path).unwrap_or_else(|e| die(&e));
+            let cfg_text = std::fs::read_to_string(&cfg_path)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", cfg_path.display())));
+            let cfg = Config::parse(&cfg_text)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", cfg_path.display())));
+            for (kind, pattern) in &cfg.sources {
+                for path in claude_secrets_hygiene::audit::expand(pattern) {
+                    for c in claude_secrets_hygiene::extract::extract(kind, &path) {
+                        let s = c.secret.trim_ascii();
+                        let class = |f: fn(&u8) -> bool, name: &'static str| {
+                            s.iter().any(f).then_some(name)
+                        };
+                        let classes: Vec<&str> = [
+                            class(u8::is_ascii_lowercase, "lower"),
+                            class(u8::is_ascii_uppercase, "upper"),
+                            class(u8::is_ascii_digit, "digit"),
+                            class(|b| b.is_ascii_punctuation(), "punct"),
+                            class(|b| !b.is_ascii(), "non-ascii"),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        println!(
+                            "{}  len={:<4} {:<24} {}",
+                            pepper.label(&pepper.fingerprint(s)),
+                            s.len(),
+                            classes.join("+"),
+                            c.location
+                        );
+                    }
+                }
+            }
+        }
+        "find-in" | "redact-in" => {
+            let cfg_path = flag(&args, "--config", CONFIG);
+            let pepper = Pepper::load(&pepper_path).unwrap_or_else(|e| die(&e));
+            let cfg_text = std::fs::read_to_string(&cfg_path)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", cfg_path.display())));
+            let cfg = Config::parse(&cfg_text)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", cfg_path.display())));
+            let dict = Dictionary::load(&cfg, &pepper);
+            let targets = operands(&args);
+            if targets.is_empty() {
+                die("name at least one file, directory, or - for stdin");
+            }
+            let hits = if cmd == "find-in" {
+                find_in(&dict, &targets)
+            } else {
+                redact_in(&dict, &targets)
+            };
+            if hits > 0 {
+                std::process::exit(1);
+            }
+        }
         _ => {
-            eprintln!("usage: claude-secrets-hygiene init | scan [--notify ADDR] | check\n  [--config C] [--pepper P] [--state S] [--report R]");
+            eprintln!("usage: claude-secrets-hygiene init | scan [--notify ADDR] | check | find-in PATH... | redact-in PATH...\n  [--config C] [--pepper P] [--state S] [--report R]");
             std::process::exit(2);
         }
     }
+}
+
+/// The non-flag arguments after the subcommand.
+fn operands(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a.starts_with("--") {
+            it.next(); // every flag here takes a value
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// Regular files under `target`, recursively; `-` stands for stdin.
+fn files_under(target: &str) -> Vec<PathBuf> {
+    let p = PathBuf::from(target);
+    if target == "-" || !p.is_dir() {
+        return vec![p];
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![p];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            die(&format!("{}: cannot read directory", dir.display()));
+        };
+        for e in rd.filter_map(Result::ok) {
+            let path = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(path),
+                Ok(t) if t.is_file() => out.push(path),
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn read_all(path: &PathBuf) -> Vec<u8> {
+    use std::io::Read;
+    if path.as_os_str() == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .unwrap_or_else(|e| die(&format!("stdin: {e}")));
+        return buf;
+    }
+    if path.extension().is_some_and(|x| x == "gz") {
+        let out = std::process::Command::new("gzip")
+            .arg("-dc")
+            .arg(path)
+            .output()
+            .unwrap_or_else(|e| die(&format!("gzip: {e}")));
+        if !out.status.success() {
+            die(&format!("{}: gzip could not read it", path.display()));
+        }
+        return out.stdout;
+    }
+    std::fs::read(path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())))
+}
+
+fn coverage_line(dict: &Dictionary, files: usize, hits: usize, with_hits: usize) -> String {
+    let mut unsearched = Vec::new();
+    if dict.too_short() > 0 {
+        unsearched.push(format!("{} shorter than {MIN_LEN} bytes", dict.too_short()));
+    }
+    if dict.weak() > 0 {
+        unsearched.push(format!("{} word-like (weak: rotate)", dict.weak()));
+    }
+    let short = if unsearched.is_empty() {
+        String::new()
+    } else {
+        format!(" (not searchable: {})", unsearched.join(", "))
+    };
+    format!(
+        "searched {files} file(s) for {} known credential(s){short}: {hits} occurrence(s) in {with_hits} file(s)",
+        dict.credentials()
+    )
+}
+
+/// Count occurrences per file. Never prints a value or a location.
+fn find_in(dict: &Dictionary, targets: &[String]) -> usize {
+    let (mut files, mut total, mut with_hits) = (0, 0, 0);
+    for t in targets {
+        for path in files_under(t) {
+            files += 1;
+            let by = dict.count(&read_all(&path));
+            let n: usize = by.values().sum();
+            if n > 0 {
+                with_hits += 1;
+                total += n;
+                let labels: Vec<String> = by.iter().map(|(l, c)| format!("{l}×{c}")).collect();
+                println!("{}: {n} ({})", path.display(), labels.join(", "));
+            }
+        }
+    }
+    println!("{}", coverage_line(dict, files, total, with_hits));
+    total
+}
+
+/// Replace occurrences in place. Refuses stdin and compressed files: a
+/// redacted copy must land where the caller expects it, atomically.
+fn redact_in(dict: &Dictionary, targets: &[String]) -> usize {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut files, mut total, mut with_hits) = (0, 0, 0);
+    for t in targets {
+        for path in files_under(t) {
+            if path.as_os_str() == "-" || path.extension().is_some_and(|x| x == "gz") {
+                die(&format!(
+                    "{}: redact-in only rewrites plain files",
+                    path.display()
+                ));
+            }
+            files += 1;
+            let (out, n) = dict.redact(&read_all(&path));
+            if n == 0 {
+                continue;
+            }
+            with_hits += 1;
+            total += n;
+            let mode = std::fs::metadata(&path).map_or(0o600, |m| m.permissions().mode() & 0o777);
+            let tmp = path.with_extension("redact-tmp");
+            let _ = std::fs::remove_file(&tmp);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&tmp)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", tmp.display())));
+            f.write_all(&out)
+                .and_then(|()| f.sync_all())
+                .unwrap_or_else(|e| die(&format!("{}: {e}", tmp.display())));
+            std::fs::rename(&tmp, &path)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+            println!("{}: {n} replaced", path.display());
+        }
+    }
+    println!("{}", coverage_line(dict, files, total, with_hits));
+    total
 }
 
 fn write_private(path: &PathBuf, body: &str) -> Result<(), String> {

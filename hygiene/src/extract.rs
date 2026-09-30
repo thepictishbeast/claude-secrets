@@ -62,6 +62,7 @@ pub fn is_secret_key(name: &str) -> bool {
         "_URL",
         "_URI",
         "_HOST",
+        "_DOMAIN",
         "_PORT",
         "_EMAIL",
         "_ID",
@@ -359,6 +360,8 @@ mod tests {
         assert!(!is_secret_key("API_KEY_ID"));
         assert!(!is_secret_key("SMTP_USER"));
         assert!(!is_secret_key("AUTH_URL"));
+        // A hostname, found holding "auth.<domain>" in a real .env.
+        assert!(!is_secret_key("AUTH_DOMAIN"));
         assert!(!is_secret_key("DB_HOST"));
     }
 

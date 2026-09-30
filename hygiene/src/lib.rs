@@ -7,6 +7,7 @@
 pub mod audit;
 pub mod extract;
 pub mod fingerprint;
+pub mod known;
 pub mod state;
 
 /// `YYYY-MM-DD` for a Unix timestamp, without a date crate.

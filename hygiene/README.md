@@ -78,6 +78,32 @@ Every report ends with a **coverage** table: for each source, how many files and
 secrets it reached, and which matched files yielded nothing. A clean report is
 only as good as its coverage, and the table is how you check it.
 
+## Finding known credentials in other files
+
+```
+claude-secrets-hygiene find-in PATH...     # count occurrences; exit 1 if any
+claude-secrets-hygiene redact-in PATH...   # replace them in place
+claude-secrets-hygiene labels              # label, length and character classes per location
+```
+
+`find-in` and `redact-in` search for every credential the configured sources
+hold. Each credential is matched in the forms it takes when it leaks: as
+written, JSON-escaped (a transcript line), percent-encoded (a URL), inside
+base64 at any byte alignment (an `Authorization: Basic` header), and, for a
+multi-line key, line by line. Directories are read recursively, `.gz` files
+through gzip, and `-` means stdin. `redact-in` writes `[REDACTED:cred-xxxxxx]`,
+the report label, so two redactions of one credential are recognisable without
+showing where it lives.
+
+Two kinds of credential are counted rather than searched, and the coverage line
+says so: those shorter than 8 bytes, and **word-like** ones (under 12 bytes and
+all one character class). Searching for a word-like password flags ordinary
+text, and replacing every occurrence would spell it out by context. Treat a
+word-like credential as a finding: rotate it.
+
+`labels` shows no values. It is how you map a label from `find-in` back to its
+location, and judge a false alarm by the secret's shape.
+
 ## Files
 
 | Path | Mode | Holds |
