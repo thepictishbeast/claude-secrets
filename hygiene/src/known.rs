@@ -21,14 +21,33 @@ use zeroize::Zeroizing;
 /// can say what it did not cover.
 pub const MIN_LEN: usize = 8;
 
-/// A secret this short and this uniform reads like an ordinary word or
-/// number. Searching for it flags ordinary text, and replacing every
-/// occurrence would give it away by context, so it is counted as weak instead.
+/// A secret that reads like an ordinary word or a short number. Searching
+/// for it flags ordinary text, and replacing every occurrence would give it
+/// away by context, so it is counted as weak instead.
+///
+/// Shape alone is not enough: a random 11-letter token is one character
+/// class too, and must still be searched. A word has vowels in a normal
+/// proportion and no long consonant run; random letters rarely do.
 fn word_like(s: &[u8]) -> bool {
-    s.len() < 12
-        && (s.iter().all(u8::is_ascii_lowercase)
-            || s.iter().all(u8::is_ascii_uppercase)
-            || s.iter().all(u8::is_ascii_digit))
+    if s.len() >= 12 {
+        return false;
+    }
+    if s.iter().all(u8::is_ascii_digit) {
+        return true;
+    }
+    let one_case = s.iter().all(u8::is_ascii_lowercase) || s.iter().all(u8::is_ascii_uppercase);
+    if !one_case {
+        return false;
+    }
+    let vowel = |b: &u8| b"aeiouy".contains(&b.to_ascii_lowercase());
+    let vowels = s.iter().filter(|b| vowel(b)).count();
+    let mut run = 0;
+    let mut longest = 0;
+    for b in s {
+        run = if vowel(b) { 0 } else { run + 1 };
+        longest = longest.max(run);
+    }
+    vowels * 4 >= s.len() && longest <= 3
 }
 
 /// A line of a multi-line secret is searched on its own only when it is
@@ -54,6 +73,7 @@ pub struct Dictionary {
     credentials: usize,
     too_short: usize,
     weak: usize,
+    uncovered: Vec<String>,
 }
 
 /// One occurrence: where it starts, how long it is, and which credential.
@@ -162,12 +182,26 @@ impl Dictionary {
     #[must_use]
     pub fn load(cfg: &Config, pepper: &Pepper) -> Self {
         let mut secrets: Vec<Zeroizing<Vec<u8>>> = Vec::new();
+        let mut uncovered = Vec::new();
         for (kind, pattern) in &cfg.sources {
-            for path in expand(pattern) {
+            let files = expand(pattern);
+            if files.is_empty() {
+                uncovered.push(pattern.clone());
+            }
+            for path in files {
                 secrets.extend(extract(kind, &path).into_iter().map(|c| c.secret));
             }
         }
-        Self::from_secrets(&secrets, pepper)
+        let mut d = Self::from_secrets(&secrets, pepper);
+        d.uncovered = uncovered;
+        d
+    }
+
+    /// Configured sources that matched no file this run. The dictionary is
+    /// missing whatever they hold, so a clean search cannot be trusted.
+    #[must_use]
+    pub fn uncovered(&self) -> &[String] {
+        &self.uncovered
     }
 
     /// Build from secrets already in hand.
@@ -180,6 +214,7 @@ impl Dictionary {
             credentials: 0,
             too_short: 0,
             weak: 0,
+            uncovered: Vec::new(),
         };
         let mut seen = std::collections::BTreeSet::new();
         for s in secrets {
@@ -239,27 +274,35 @@ impl Dictionary {
     /// overlapping.
     #[must_use]
     pub fn find(&self, hay: &[u8]) -> Vec<Hit> {
-        let mut hits = Vec::new();
-        let mut i = 0;
-        while i + MIN_LEN <= hay.len() {
+        // Every position is tried, even inside an earlier match: skipping
+        // ahead would miss a second credential that overlaps the first, and
+        // redaction would then leave most of it behind. Overlapping matches
+        // are merged into one span, named by the first credential in it.
+        let mut hits: Vec<Hit> = Vec::new();
+        for i in 0..hay.len().saturating_sub(MIN_LEN - 1) {
             let key = prefix(&hay[i..]);
             let s = slot(key);
-            if self.filter[s / 64] & (1 << (s % 64)) != 0 {
-                if let Some(n) = self.by_prefix.get(&key).and_then(|list| {
-                    list.iter()
-                        .map(|&k| &self.needles[k])
-                        .find(|n| hay[i..].starts_with(&n.bytes))
-                }) {
-                    hits.push(Hit {
-                        start: i,
-                        len: n.bytes.len(),
-                        label: n.label.clone(),
-                    });
-                    i += n.bytes.len();
-                    continue;
-                }
+            if self.filter[s / 64] & (1 << (s % 64)) == 0 {
+                continue;
             }
-            i += 1;
+            let Some(n) = self.by_prefix.get(&key).and_then(|list| {
+                list.iter()
+                    .map(|&k| &self.needles[k])
+                    .find(|n| hay[i..].starts_with(&n.bytes))
+            }) else {
+                continue;
+            };
+            let end = i + n.bytes.len();
+            match hits.last_mut() {
+                Some(last) if i < last.start + last.len => {
+                    last.len = end.max(last.start + last.len) - last.start;
+                }
+                _ => hits.push(Hit {
+                    start: i,
+                    len: n.bytes.len(),
+                    label: n.label.clone(),
+                }),
+            }
         }
         hits
     }
@@ -392,6 +435,29 @@ mod tests {
         // Otherwise every "sunshine" in ordinary prose would be a "leak", and
         // redacting them all would spell the password out by context.
         assert!(d.find(b"a sunshine day, call 12345678901").is_empty());
+    }
+
+    #[test]
+    fn a_random_single_case_token_is_still_searched() {
+        // One character class, under 12 bytes, but not a word.
+        let d = dict(&[b"qzkxvbnmwpt"]);
+        assert_eq!(d.weak(), 0);
+        assert_eq!(d.find(b"token=qzkxvbnmwpt").len(), 1);
+    }
+
+    #[test]
+    fn overlapping_credentials_are_both_removed() {
+        let a: &[u8] = b"abcdefgh12345";
+        let b: &[u8] = b"12345zyxwvuts";
+        let d = dict(&[a, b]);
+        let (out, n) = d.redact(b"x abcdefgh12345zyxwvuts y");
+        assert_eq!(n, 1, "one merged span");
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.starts_with("x [REDACTED:cred-") && s.ends_with("] y"),
+            "{s}"
+        );
+        assert!(!s.contains("zyxw") && !s.contains("abcdefgh"));
     }
 
     #[test]

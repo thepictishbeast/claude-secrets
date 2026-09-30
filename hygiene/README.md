@@ -96,10 +96,18 @@ the report label, so two redactions of one credential are recognisable without
 showing where it lives.
 
 Two kinds of credential are counted rather than searched, and the coverage line
-says so: those shorter than 8 bytes, and **word-like** ones (under 12 bytes and
-all one character class). Searching for a word-like password flags ordinary
+says so: those shorter than 8 bytes, and **word-like** ones: under 12 bytes and
+either all digits or letters of one case that read like a word (vowels in a
+normal proportion, no run of more than three consonants). A random token of the
+same shape is still searched. Searching for a word-like password flags ordinary
 text, and replacing every occurrence would spell it out by context. Treat a
 word-like credential as a finding: rotate it.
+
+Both commands **fail closed**: if a configured source matches no file (a pool
+still locked after a reboot, a moved file), they exit 2 instead of searching a
+smaller dictionary and reporting a clean result. `redact-in` keeps each file's
+owner and mode, refuses symlinks and hard-linked files, and carries over any
+lines a live writer appends while the file is being rewritten.
 
 `labels` shows no values. It is how you map a label from `find-in` back to its
 location, and judge a false alarm by the secret's shape.

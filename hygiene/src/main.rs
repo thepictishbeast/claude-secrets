@@ -136,6 +136,16 @@ fn main() {
             let cfg = Config::parse(&cfg_text)
                 .unwrap_or_else(|e| die(&format!("{}: {e}", cfg_path.display())));
             let dict = Dictionary::load(&cfg, &pepper);
+            // Fail closed: a source that matched nothing (a pool still locked,
+            // a file moved) means credentials missing from the search, and a
+            // "0 found" that would be believed.
+            if !dict.uncovered().is_empty() {
+                die(&format!(
+                    "cannot vouch for the search: {} configured source(s) matched no file: {}",
+                    dict.uncovered().len(),
+                    dict.uncovered().join(", ")
+                ));
+            }
             let targets = operands(&args);
             if targets.is_empty() {
                 die("name at least one file, directory, or - for stdin");
@@ -260,7 +270,8 @@ fn find_in(dict: &Dictionary, targets: &[String]) -> usize {
 /// Replace occurrences in place. Refuses stdin and compressed files: a
 /// redacted copy must land where the caller expects it, atomically.
 fn redact_in(dict: &Dictionary, targets: &[String]) -> usize {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let (mut files, mut total, mut with_hits) = (0, 0, 0);
     for t in targets {
         for path in files_under(t) {
@@ -270,28 +281,70 @@ fn redact_in(dict: &Dictionary, targets: &[String]) -> usize {
                     path.display()
                 ));
             }
+            // Replacing a symlink would swap a regular file in for the link
+            // and leave its target untouched: refuse rather than half-work.
+            let meta = std::fs::symlink_metadata(&path)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+            if !meta.file_type().is_file() {
+                die(&format!("{}: not a regular file", path.display()));
+            }
+            // A hard link's other names would keep the unredacted bytes.
+            if meta.nlink() > 1 {
+                die(&format!(
+                    "{}: has {} hard links",
+                    path.display(),
+                    meta.nlink()
+                ));
+            }
             files += 1;
-            let (out, n) = dict.redact(&read_all(&path));
+            // Hold the original open: a writer that appends by path (a live
+            // transcript) may add lines while this runs, and they land in
+            // the original inode. They are carried over after the swap.
+            let mut orig = std::fs::File::open(&path)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+            let mut buf = Vec::new();
+            orig.read_to_end(&mut buf)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+            let (out, n) = dict.redact(&buf);
             if n == 0 {
                 continue;
             }
             with_hits += 1;
             total += n;
-            let mode = std::fs::metadata(&path).map_or(0o600, |m| m.permissions().mode() & 0o777);
             let tmp = path.with_extension("redact-tmp");
             let _ = std::fs::remove_file(&tmp);
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(mode)
+                .mode(meta.permissions().mode() & 0o777)
                 .open(&tmp)
                 .unwrap_or_else(|e| die(&format!("{}: {e}", tmp.display())));
-            f.write_all(&out)
+            // Same owner, or the user whose session writes this file can no
+            // longer append to it.
+            std::os::unix::fs::fchown(&f, Some(meta.uid()), Some(meta.gid()))
+                .and_then(|()| f.write_all(&out))
                 .and_then(|()| f.sync_all())
                 .unwrap_or_else(|e| die(&format!("{}: {e}", tmp.display())));
             std::fs::rename(&tmp, &path)
                 .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
-            println!("{}: {n} replaced", path.display());
+            let mut tail = Vec::new();
+            orig.read_to_end(&mut tail)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+            let mut carried = String::new();
+            if !tail.is_empty() {
+                let (tail, m) = dict.redact(&tail);
+                total += m;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut a| a.write_all(&tail))
+                    .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+                carried = format!(
+                    "; {} byte(s) appended during the rewrite carried over",
+                    tail.len()
+                );
+            }
+            println!("{}: {n} replaced{carried}", path.display());
         }
     }
     println!("{}", coverage_line(dict, files, total, with_hits));

@@ -65,6 +65,7 @@ pub fn is_secret_key(name: &str) -> bool {
         "_DOMAIN",
         "_PORT",
         "_EMAIL",
+        "_FROM",
         "_ID",
         "_NAME",
         "_PATH",
@@ -362,6 +363,8 @@ mod tests {
         assert!(!is_secret_key("AUTH_URL"));
         // A hostname, found holding "auth.<domain>" in a real .env.
         assert!(!is_secret_key("AUTH_DOMAIN"));
+        // An address: "AUTH" matched inside the product name Authentik.
+        assert!(!is_secret_key("AUTHENTIK_EMAIL_FROM"));
         assert!(!is_secret_key("DB_HOST"));
     }
 
