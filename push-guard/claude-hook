@@ -26,11 +26,22 @@ fi
 # Setting or removing core.hooksPath (never reading or mentioning it): the -c
 # form, `git config` writes and unsets, and the environment-variable forms.
 if printf '%s' "$flat" | /usr/bin/grep -qiE '(^|[;&|( ])git( +[^;&|]*)? -c +core\.hookspath=' ||
-   printf '%s' "$flat" | /usr/bin/grep -iE '(^|[;&|( ])git( +[^;&|]*)? config( +[^;&|]*)? core\.hookspath' |
-     /usr/bin/grep -qviE 'config( +--(global|system|local|worktree|file[= ][^ ]+))* +--get(-all|-regexp)? +core\.hookspath' ||
    printf '%s' "$flat" | /usr/bin/grep -qiE 'GIT_CONFIG_(PARAMETERS|KEY_[0-9]+)=[^ ]*hookspath'; then
   deny "changing core.hooksPath would disable the push guard."
 fi
+# `git config` is judged one simple command at a time, so a read cannot vouch
+# for a write chained after it. A command passes only if the read option or
+# subcommand comes before the key and nothing in it writes.
+read_form='(^| )config(( +(--file|-f|--blob)[= ][^ ]+)|( +-[^ ]+))* +(--get(-all|-regexp)?|get)(( +(--file|-f|--blob)[= ][^ ]+)|( +-[^ ]+))* +core\.hookspath( +[^ -][^ ]*)?$'
+write_form='(^| )(--(unset(-all)?|replace-all|add|edit|rename-section|remove-section)|set|unset|edit)( |=|$)'
+while IFS= read -r seg; do
+  seg=$(printf '%s' "$seg" | sed -E 's/^ +//; s/ +$//')
+  printf '%s' "$seg" | /usr/bin/grep -qiE '(^| )git( .*)? config( .*)? core\.hookspath' || continue
+  if printf '%s' "$seg" | /usr/bin/grep -qiE "$read_form" && ! printf '%s' "$seg" | /usr/bin/grep -qiE "$write_form"; then
+    continue
+  fi
+  deny "changing core.hooksPath would disable the push guard."
+done < <(printf '%s\n' "$cmd" | tr ';&|()`{}\n' '\n\n\n\n\n\n\n\n' | tr -s ' ')
 if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +repo +create( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE '(^| )--public( |$)'; then
   deny "creating a PUBLIC repository is Paul's decision."
 fi

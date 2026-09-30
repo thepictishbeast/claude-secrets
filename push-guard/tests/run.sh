@@ -150,6 +150,17 @@ deny_case "git config --system --unset core.hooksPath"
 deny_case "GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/tmp git push"
 allow_case "git config --get core.hooksPath"
 allow_case "runuser -u paul -- git config --system --get core.hooksPath"
+# A read must not vouch for a write elsewhere in the same command.
+deny_case "git config --get core.hooksPath; git config core.hooksPath /dev/null"
+deny_case "git config --get core.hooksPath && git config --global core.hooksPath /tmp/h"
+deny_case "x=\$(git config --get core.hooksPath) || git config --unset-all core.hooksPath"
+deny_case "git config set core.hooksPath /tmp/h"
+deny_case "git config --file /etc/gitconfig core.hooksPath /tmp/h"
+deny_case "git config core.hooksPath /tmp/h --get"
+allow_case "runuser -u paul -- git config --show-origin --get-all core.hooksPath"
+allow_case "git config get core.hooksPath"
+allow_case "git config --file /etc/gitconfig --get core.hooksPath"
+allow_case "h=\$(git -C /x config --get core.hooksPath); echo \"\$h\""
 allow_case "echo 'the guard sets core.hooksPath system-wide' > notes.md"
 allow_case "cat > msg <<'EOF'
 push-guard: uses core.hooksPath with a dispatcher; denies --no-verify
