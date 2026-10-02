@@ -44,8 +44,10 @@ Fix the commits. If they're unpushed, rewrite them: use `--amend`, or
 `git filter-branch --tree-filter` over the unpushed range. A fix-up commit on
 top would still publish the originals.
 
-The only bypass is a person running `git push --no-verify` themselves. Claude
-sessions are denied that flag.
+The intended way past is a person running `git push --no-verify` themselves.
+Claude sessions are denied that flag, and the other routes the Claude hook
+can recognise are listed under Parts. Routes it cannot recognise are under
+Known limits.
 
 ## Known limits
 
@@ -58,9 +60,23 @@ sessions are denied that flag.
   one.** None did on 2026-09-30.
 - **A credential that is neither known nor shaped like one can't be caught.**
   Keep the credential sources in `hygiene.conf` complete.
-- **The Claude hook reads command text, so it is a tripwire, not a wall.** A
-  command written to a script file and then run isn't seen. Neither is a root
-  session editing `/etc/gitconfig` or the files under
-  `/usr/local/lib/git-guard/` directly, nor `git config --edit` with an editor
-  of its choosing. Stopping those would take file permissions, not pattern
-  matching.
+- **The Claude hook reads command text, so it is a tripwire, not a wall.**
+  It denies `--no-verify` (abbreviated too), absolute paths and quoted forms
+  of git, `-c`/`--config-env` and include overrides, `GIT_CONFIG_NOSYSTEM`,
+  `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_GLOBAL`, section removal, `git config
+  --edit`, shell writes to git config files (named or by wildcard), option
+  names built from `$…` or backticks, `git push` arguments taken from a
+  variable, and `gh` visibility or settings values built at run time. It
+  does not see:
+  - a command string assembled from pieces and run with `eval` or
+    `bash -c`;
+  - a command written to a script file and then run;
+  - a root session editing `/etc/gitconfig` or the files under
+    `/usr/local/lib/git-guard/` with the Write or Edit tools;
+  - `HOME=` or `XDG_CONFIG_HOME=` pointing git at a prepared global config;
+  - shell tools other than Bash, such as an MCP server's command runner,
+    because the hook's matcher is `Bash`.
+
+  Stopping those would take file permissions, not pattern matching. The git
+  pre-push hook still runs in every one of these cases unless the system
+  config was also bypassed.

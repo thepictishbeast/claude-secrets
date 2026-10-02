@@ -2,61 +2,204 @@
 # Claude Code PreToolUse hook (matcher: Bash). The git pre-push guard checks
 # every push; this hook stops a session from routing around it, and from
 # making anything public on its own:
-#   - `git push --no-verify` (skips the guard)
-#   - any git command that touches core.hooksPath (disables the guard)
+#   - `--no-verify` on any git command, abbreviated or not (skips hooks)
+#   - anything that sets, removes or overrides core.hooksPath: `git config`
+#     writes, section removal, `-c`/`--config-env`, config includes, the
+#     GIT_CONFIG_* environment forms, and shell writes to git config files
 #   - creating a public repo, making a repo public, a public gist, or writing
 #     files through the GitHub contents API (commits that bypass git hooks)
 # Each of these is Paul's decision: the session is told to ask him.
+#
+# It matches command text, so it is a tripwire rather than a wall; see the
+# README's known limits.
 set -uo pipefail
+# The command is split into words below; never let this shell expand them.
+set -f
 cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -z "$cmd" ] && exit 0
-flat=$(printf '%s' "$cmd" | tr '\n' ' ' | tr -s ' ')
 
 deny() {
   jq -cn --arg r "push-guard: $1 Ask Paul; he can do it himself if he wants it." \
     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
   exit 0
 }
+has() { printf '%s' "$2" | /usr/bin/grep -qiE -- "$1"; }
 
-is_git_push() { printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])git( +(-C|-c) +[^ ]+| +--[a-z-]+(=[^ ]+)?)* +push( |$)'; }
+# Quotes and backslashes removed, so "git", 'git' and \git all read as git.
+norm=$(printf '%s' "$cmd" | tr -d "\"'\\\\" | tr '\t' ' ')
+flat=$(printf '%s' "$norm" | tr '\n' ' ' | tr -s ' ')
+# What may come before a command name, including the end of a path.
+B='(^|[;&|(){}` /])'
+# Keys whose value can replace or cancel the system hooksPath.
+KEY='(core\.hookspath|include\.path|includeif\.[^ =]*\.path)'
 
-if is_git_push && printf '%s' "$flat" | /usr/bin/grep -qE '(^| )--no-verify( |$)'; then
-  deny "\`git push --no-verify\` skips the check that keeps secrets and private data out of pushes."
+# Environment that makes git skip or replace the system configuration, which
+# is where the guard's hooksPath lives.
+if has '(^|[^A-Za-z0-9_])GIT_CONFIG_(NOSYSTEM|SYSTEM|GLOBAL)=' "$flat"; then
+  deny "pointing git away from the system configuration would skip the push guard."
 fi
-# Setting or removing core.hooksPath (never reading or mentioning it): the -c
-# form, `git config` writes and unsets, and the environment-variable forms.
-if printf '%s' "$flat" | /usr/bin/grep -qiE '(^|[;&|( ])git( +[^;&|]*)? -c +core\.hookspath=' ||
-   printf '%s' "$flat" | /usr/bin/grep -qiE 'GIT_CONFIG_(PARAMETERS|KEY_[0-9]+)=[^ ]*hookspath'; then
-  deny "changing core.hooksPath would disable the push guard."
+if has "GIT_CONFIG_(PARAMETERS|KEY_[0-9]+)=[^ ]*(hookspath|include)" "$flat" ||
+   has "${B}git( +[^;&|]*)? (-c +|--config-env[= ]+)${KEY}=" "$flat"; then
+  deny "overriding core.hooksPath would disable the push guard."
 fi
-# `git config` is judged one simple command at a time, so a read cannot vouch
-# for a write chained after it. A command passes only if the read option or
-# subcommand comes before the key and nothing in it writes.
-read_form='(^| )config(( +(--file|-f|--blob)[= ][^ ]+)|( +-[^ ]+))* +(--get(-all|-regexp)?|get)(( +(--file|-f|--blob)[= ][^ ]+)|( +-[^ ]+))* +core\.hookspath( +[^ -][^ ]*)?$'
+
+# The rest is judged one simple command at a time, so a harmless command
+# cannot vouch for a harmful one chained to it. Backticks stay inside the
+# command they belong to.
+read_form="(^| )config(( +(--file|-f|--blob)[= ][^ ]+)|( +-[^ ]+))* +(--get(-all|-regexp)?|get)(( +(--file|-f|--blob)[= ][^ ]+)|( +-[^ ]+))* +${KEY}( +[^ -][^ ]*)?$"
 write_form='(^| )(--(unset(-all)?|replace-all|add|edit|rename-section|remove-section)|set|unset|edit)( |=|$)'
+# Config files git reads, matched as whole names (so .git/config.orig and
+# new.gitconfig are not): the system file, the two global locations, and a
+# repository's own config, which overrides both.
+SYS_GLOBAL='(/etc/gitconfig|([^ <>=]*/)?\.gitconfig|[^ <>=]*\.config/git/config)'
+CONF_FILE="(${SYS_GLOBAL}|[^ <>=]*\.git/config)"
+# The same files as literal paths, for wildcard checks.
+CONF_PATHS=(/etc/gitconfig '~/.gitconfig' '~/.config/git/config' /root/.gitconfig
+  /root/.config/git/config /home/paul/.gitconfig /home/paul/.config/git/config
+  .gitconfig .config/git/config)
+# Would the shell glob PATTERN match PATH? Component by component, since a
+# wildcard never crosses `/`, and a leading dot must be matched explicitly.
+glob_hits() {
+  local IFS=/ i
+  local -a p=($1) c=($2)
+  [ "${#p[@]}" -eq "${#c[@]}" ] || return 1
+  for ((i = 0; i < ${#p[@]}; i++)); do
+    [[ ${c[i]} == .* && ${p[i]} != .* ]] && return 1
+    [[ ${c[i]} == ${p[i]} ]] || return 1
+  done
+}
+WRITE_CMD='(^|[ /])(tee|sed|perl|cp|mv|install|ln|dd|rm|truncate|shred|unlink)( |$)|(^| |[0-9])>>? *[^& ]'
+# The command with every quoted span blanked: a wildcard that survives here
+# is one the shell would actually expand.
+UNQUOTED=$(printf '%s' "$cmd" | tr '\n' ' ' | sed -E "s/'[^']*'/ /g; s/\"[^\"]*\"/ /g")
+# The words one simple command writes to, one per line: redirect targets,
+# dd's of=, a copy/move/install/link destination, every operand of a delete
+# or a tee, and the files of an in-place sed or perl.
+write_targets() {
+  local -a w=($1) args=()
+  local i j n=${#w[@]} c inplace=0
+  for ((i = 0; i < n; i++)); do
+    case "${w[i]}" in
+      '>' | '>>' | [0-9]'>' | [0-9]'>>')
+        ((i + 1 < n)) && printf '%s\n' "${w[i + 1]}"
+        ((i++))
+        continue ;;
+      *'>'*)
+        local t=${w[i]##*>}
+        [ -n "$t" ] && [[ $t != \&* ]] && printf '%s\n' "$t"
+        continue ;;
+      of=*) printf '%s\n' "${w[i]#of=}" ;;
+    esac
+    args+=("${w[i]}")
+  done
+  n=${#args[@]}
+  for ((i = 0; i < n; i++)); do
+    c=${args[i]##*/}
+    case "$c" in
+      cp | mv | install | ln)
+        printf '%s\n' "${args[n - 1]}"
+        return ;;
+      rm | truncate | shred | unlink | tee)
+        for ((j = i + 1; j < n; j++)); do [[ ${args[j]} == -* ]] || printf '%s\n' "${args[j]}"; done
+        return ;;
+      sed | perl)
+        for ((j = i + 1; j < n; j++)); do [[ ${args[j]} =~ ^(-[a-zA-Z]*i|--in-place) ]] && inplace=1; done
+        ((inplace)) && for ((j = i + 1; j < n; j++)); do [[ ${args[j]} == -* ]] || printf '%s\n' "${args[j]}"; done
+        return ;;
+    esac
+  done
+}
+# Subcommands whose --no-verify skips only their own commit hooks, never the
+# pre-push hook. Anything else may be push or an alias for it.
+COMMIT_LIKE='(commit|merge|am|rebase|cherry-pick|revert)'
+GIT_OPTS='(( +-[Cc] +[^ ]+)|( +--(git-dir|work-tree|namespace|config-env) +[^ ]+)|( +--[a-z-]+(=[^ ]+)?)|( +-[A-Za-z]+))*'
+
 while IFS= read -r seg; do
   seg=$(printf '%s' "$seg" | sed -E 's/^ +//; s/ +$//')
-  printf '%s' "$seg" | /usr/bin/grep -qiE '(^| )git( .*)? config( .*)? core\.hookspath' || continue
-  if printf '%s' "$seg" | /usr/bin/grep -qiE "$read_form" && ! printf '%s' "$seg" | /usr/bin/grep -qiE "$write_form"; then
-    continue
+  [ -z "$seg" ] && continue
+
+  if has "${B}(git|gh)( |$)" "$seg"; then
+    # A long option whose NAME is built by an expansion can't be read here.
+    # A value may be (`--since=$D`), and so may a short option's attached
+    # value (`-S$(…)`).
+    has '(^| )--[A-Za-z0-9-]*(\$|`[A-Za-z$(])' "$seg" &&
+      deny "an option name built from a variable or command substitution can't be checked; write it out."
   fi
-  deny "changing core.hooksPath would disable the push guard."
-done < <(printf '%s\n' "$cmd" | tr ';&|()`{}\n' '\n\n\n\n\n\n\n\n' | tr -s ' ')
-if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +repo +create( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE '(^| )--public( |$)'; then
-  deny "creating a PUBLIC repository is Paul's decision."
-fi
-if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +repo +edit( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE -- '--visibility[= ]+public'; then
-  deny "making a repository public is Paul's decision."
-fi
-if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +api( |$)' &&
-   printf '%s' "$flat" | /usr/bin/grep -qiE '(private[=:]+ *"?false|visibility[=:]+ *"?public)'; then
-  deny "changing a repository to public through the API is Paul's decision."
-fi
-if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +gist +create( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE '(^| )(--public|-p)( |$)'; then
-  deny "a public gist publishes content without any check."
-fi
-if printf '%s' "$flat" | /usr/bin/grep -qE '(^|[;&|( ])gh +api( |$)' && printf '%s' "$flat" | /usr/bin/grep -qE '/contents/' &&
-   printf '%s' "$flat" | /usr/bin/grep -qiE '(-X|--method) *(PUT|POST|PATCH|DELETE)'; then
-  deny "writing files through the GitHub contents API makes commits that skip the push guard; use git."
-fi
+
+  if has "${B}git( |$)" "$seg"; then
+    if has '(^| )--no-veri[a-z]*( |=|$)' "$seg" &&
+       { ! has "${B}git${GIT_OPTS} +${COMMIT_LIKE}( |$)" "$seg" || has '(^| )push( |$)' "$seg"; }; then
+      deny "\`--no-verify\` on a push skips the check that keeps secrets and private data out of pushes."
+    fi
+    # `config` as git's subcommand: only global options may come before it.
+    if has "${B}git${GIT_OPTS} +config( |$)" "$seg"; then
+      has '(^| )(-e|--edit|edit)( |$)' "$seg" &&
+        deny "editing git configuration through an editor can remove the push guard's setting."
+      has '(^| )(--)?(remove|rename)-section( .*)? core( |$)' "$seg" &&
+        deny "removing the core section would remove the push guard's setting."
+      if has "$KEY" "$seg"; then
+        has "$read_form" "$seg" && ! has "$write_form" "$seg" && continue
+        deny "changing core.hooksPath or a config include would disable the push guard."
+      fi
+    fi
+  fi
+
+  # Shell writes to a git config file, bypassing `git config` entirely: a
+  # redirect or tee into one, an in-place edit of one, a copy/move/install/
+  # link whose destination is one (or puts a file of that name into /etc or
+  # .git), dd onto one, and deleting the system or global file.
+  last=${seg##* }
+  if { has "(^| |[0-9])>>? *${CONF_FILE}( |$)" "$seg" ||
+       has "(^| )tee( +-a)?( +[^ ]+)* +${CONF_FILE}( |$)" "$seg" ||
+       { has '(^|[ /])(sed|perl)( +[^ ]+)* +(-i|--in-place|-[a-z]*i)' "$seg" && has "(^| )${CONF_FILE}( |$)" "$seg"; } ||
+       { has '(^|[ /])(cp|mv|install|ln)( |$)' "$seg" &&
+         { has "^${CONF_FILE}/?$" "$last" ||
+           { has '^/etc/?$' "$last" && has '(^|[ /])gitconfig ' "$seg"; } ||
+           { has '\.git/?$' "$last" && has '(^|[ /])config ' "$seg"; }; }; } ||
+       has "(^| )of=${CONF_FILE}( |$)" "$seg" ||
+       { has '(^|[ /])(rm|truncate|shred|unlink)( |$)' "$seg" && has "(^| )${SYS_GLOBAL}( |$)" "$seg"; }; }; then
+    deny "writing a git config file directly can disable the push guard; use git config, which this hook can read."
+  fi
+  # The same writes through a wildcard that would expand to a config file:
+  # only a wildcard the shell would expand (unquoted) in a place the command
+  # writes. Quoted patterns, such as a sed or grep expression, never expand,
+  # and a wildcard that is only read cannot replace a config.
+  if has "$WRITE_CMD" "$seg"; then
+    while IFS= read -r w; do
+      case "$w" in *[*?[]*) ;; *) continue ;; esac
+      [[ $UNQUOTED == *"$w"* ]] || continue
+      for c in "${CONF_PATHS[@]}"; do
+        glob_hits "$w" "$c" &&
+          deny "a wildcard path that would match a git config file can't be checked; name the file."
+      done
+      # A repository's own config, at any depth: the last two parts.
+      case "$w" in */*) two="${w%/*}"; two="${two##*/}/${w##*/}" ;; *) two="" ;; esac
+      [ -n "$two" ] && glob_hits "$two" ".git/config" &&
+        deny "a wildcard path that would match a git config file can't be checked; name the file."
+    done < <(write_targets "$seg")
+  fi
+
+  # GitHub: anything that makes content public, or skips git entirely.
+  if has "${B}gh( |$)" "$seg"; then
+    has '(^| )repo +create( |$)' "$seg" && has '(^| )--public( |$)' "$seg" &&
+      deny "creating a PUBLIC repository is Paul's decision."
+    has '(^| )repo +edit( |$)' "$seg" && has '(^| )--visibility' "$seg" &&
+      ! has '(^| )--visibility[= ]+(private|internal)( |$)' "$seg" &&
+      deny "making a repository public is Paul's decision."
+    has '(^| )gist +create( |$)' "$seg" && has '(^| )(--public|-p)( |$)' "$seg" &&
+      deny "a public gist publishes content without any check."
+    if has '(^| )api( |$)' "$seg" && ! has '(-X|--method)[= ]*GET( |$)' "$seg" &&
+       has '((-X|--method)[= ]*(PATCH|PUT|POST|DELETE)|(^| )(-f|-F|--field|--raw-field|--input)( |=))' "$seg"; then
+      has '/contents/' "$seg" &&
+        deny "writing files through the GitHub contents API makes commits that skip the push guard; use git."
+      has '(^| )(-f|-F|--field|--raw-field)[ =]+(private=false|visibility=public)( |$)' "$seg" &&
+        deny "changing a repository to public through the API is Paul's decision."
+      has '(^| )(user|orgs/[^/ ]+)/repos( |$)' "$seg" &&
+        ! has '(^| )(-f|-F|--field|--raw-field)[ =]+private=true( |$)' "$seg" &&
+        deny "creating a repository through the API without private=true is Paul's decision."
+      has '(^| )/?repos/[^/ ]+/[^/ ?]+/?( |$)' "$seg" && has '(\$|`|(^| )--input( |=))' "$seg" &&
+        deny "repository settings changed with fields built at run time can't be checked; write the fields out."
+    fi
+  fi
+done < <(printf '%s\n' "$norm" | tr ';&|(){}\n' '\n\n\n\n\n\n\n' | tr -s ' ')
 exit 0
