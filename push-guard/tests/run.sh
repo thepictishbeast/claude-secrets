@@ -92,6 +92,58 @@ if printf 'refs/heads/main %s refs/heads/main 0000000000000000000000000000000000
 else bad "real public GitHub repo check"; cat "$T/real.err"; fi
 new_repo del private; push del; git -C "$T/del" push -q origin :main 2>/dev/null && ok "a branch deletion is allowed" || bad "a branch deletion was refused"
 
+# gitleaks counts only the commits that give it text to scan. Commits with
+# none (empty, delete, binary, rename, mode change) are not a partial scan.
+new_repo notext private; commit notext a.txt "ordinary change"
+git -C "$T/notext" commit -q --allow-empty -m "checked, nothing changed"
+git -C "$T/notext" rm -q a.txt; git -C "$T/notext" commit -qm "delete only"
+printf '\000\001bin' > "$T/notext/b.bin"; git -C "$T/notext" add b.bin; git -C "$T/notext" commit -qm "binary only"
+git -C "$T/notext" mv b.bin c.bin; git -C "$T/notext" commit -qm "rename only"
+chmod +x "$T/notext/README"; git -C "$T/notext" add README; git -C "$T/notext" commit -qm "mode only"
+git -C "$T/notext" checkout -q -b side; commit notext s.txt "side"; git -C "$T/notext" checkout -q main
+commit notext m.txt "main"; git -C "$T/notext" merge -q --no-edit side
+expect_allowed notext "commits with nothing to scan (empty, delete, binary, rename, mode) and a clean merge are allowed"
+# A merge can bring in text that neither parent has. git log -p shows a merge
+# no diff, so the scans read each merge against its first parent.
+evil_merge() { # name content
+  new_repo "$1" private; git -C "$T/$1" checkout -q -b side; commit "$1" s.txt "side"
+  git -C "$T/$1" checkout -q main; commit "$1" m.txt "main"
+  git -C "$T/$1" merge -q --no-commit side >/dev/null; printf '%s\n' "$2" > "$T/$1/evil.txt"
+  git -C "$T/$1" add evil.txt; git -C "$T/$1" commit -qm "merge side"
+}
+evil_merge mergetok "token = $tok"; expect_refused mergetok "gitleaks: " "any: a token gitleaks recognises, added in a merge, is refused"
+evil_merge mergeknown "Zq7-lab-only-invented-credential-1142"; expect_refused mergeknown "known credential" "any: a known credential added in a merge is refused"
+# A scan that covers fewer commits than it should is refused. A stand-in
+# gitleaks reports a short count; the marker proves the stand-in ran.
+mkdir -p "$T/stub"; printf '#!/bin/sh\ntouch "%s/stub-ran"\necho "INF 1 commits scanned." >&2\necho "INF no leaks found" >&2\n' "$T" > "$T/stub/gitleaks"; chmod +x "$T/stub/gitleaks"
+new_repo partial private; commit partial a.txt "one"; commit partial b.txt "two"
+if PATH="$T/stub:$PATH" git -C "$T/partial" push -q origin main 2>"$T/partial.err"; then bad "a partial gitleaks scan was allowed"
+elif [ ! -e "$T/stub-ran" ]; then bad "partial-scan case: the stand-in gitleaks never ran"
+elif /usr/bin/grep -q "partial scan" "$T/partial.err"; then ok "a gitleaks scan that covers fewer commits than it should is refused"
+else bad "a partial gitleaks scan was refused without the reason"; cat "$T/partial.err"; fi
+# gitleaks git reads diffs only, so messages are scanned as text. A tag's
+# message leaves with the tag, even when its commit is already on the remote.
+new_repo msgtok private; commit msgtok a.txt "fine" "deploy with $tok"
+expect_refused msgtok "in the message of commit" "any: a token gitleaks recognises in a commit message is refused"
+push_tag() { git -C "$T/$1" tag -a v1 -m "$2"; git -C "$T/$1" push -q origin v1 2>"$T/$1.err"; }
+new_repo tagknown private; push tagknown; if push_tag tagknown "release, key Zq7-lab-only-invented-credential-1142"; then bad "any: a known credential in a tag message (was allowed)"
+elif /usr/bin/grep -q "known credential" "$T/tagknown.err"; then ok "any: a known credential in a tag message is refused"
+else bad "any: a known credential in a tag message (refused without the reason)"; cat "$T/tagknown.err"; fi
+new_repo tagtok private; push tagtok; if push_tag tagtok "release, token $tok"; then bad "any: a token in a tag message (was allowed)"
+elif /usr/bin/grep -q "in the message of tag" "$T/tagtok.err"; then ok "any: a token gitleaks recognises in a tag message is refused"
+else bad "any: a token in a tag message (refused without the reason)"; cat "$T/tagtok.err"; fi
+new_repo tagname public; push tagname; if push_tag tagname "thanks to Zebulon"; then bad "public: a denylisted name in a tag message (was allowed)"
+elif /usr/bin/grep -q "lab-name" "$T/tagname.err"; then ok "public: a denylisted name in a tag message is refused"
+else bad "public: a denylisted name in a tag message (refused without the label)"; cat "$T/tagname.err"; fi
+new_repo tagok private; push tagok; if ! push_tag tagok "release one"; then bad "a clean annotated tag was refused"; cat "$T/tagok.err"
+elif /usr/bin/grep -q "push-guard: ok" "$T/tagok.err"; then ok "a clean annotated tag is allowed"
+else bad "a clean annotated tag was allowed, but the guard never ran"; fi
+# A file renamed to a credential-shaped name is as new to the remote as one
+# added under it.
+new_repo renv private; commit renv settings.txt "X=1"; push renv
+git -C "$T/renv" mv settings.txt .env; git -C "$T/renv" commit -qm "rename"
+expect_refused renv "credential-shaped file added: .env" "any: a file renamed to .env is refused"
+
 # A root session runs git as paul, and paul inherits root's TMPDIR, which paul
 # cannot write. The guard must still check everything (this once made the
 # denylist read an empty file and pass).

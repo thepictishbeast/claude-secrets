@@ -72,9 +72,12 @@ esac
 
 # ---- 2. Which commits are leaving? ----------------------------------------
 revs=()
+tags=()
 while read -r _lref lsha _rref rsha; do
   [ -z "${lsha:-}" ] && continue
   [ "$lsha" = "$ZERO" ] && continue # a branch deletion sends no content
+  # An annotated tag carries a message of its own, which leaves with it.
+  [ "$lsha" != "$rsha" ] && [ "$(git cat-file -t "$lsha" 2>/dev/null)" = tag ] && tags+=("$lsha")
   if [ "$rsha" != "$ZERO" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
     revs+=("${rsha}..${lsha}")
   else
@@ -85,9 +88,9 @@ while read -r _lref lsha _rref rsha; do
 done
 [ ${#revs[@]} -eq 0 ] && exit 0
 commits=$(git rev-list "${revs[@]}" 2>/dev/null) || { problems+=("could not list the outgoing commits"); refuse; }
-[ -z "$commits" ] && exit 0
-n=$(printf '%s\n' "$commits" | wc -l)
-say "checking ${n} outgoing commit(s) to ${slug:-$url} (${visibility})"
+[ -z "$commits" ] && [ ${#tags[@]} -eq 0 ] && exit 0
+n=0; [ -n "$commits" ] && n=$(printf '%s\n' "$commits" | wc -l)
+say "checking ${n} outgoing commit(s)$([ ${#tags[@]} -gt 0 ] && printf ' and %d tag(s)' ${#tags[@]}) to ${slug:-$url} (${visibility})"
 
 # Scratch space of our own. TMPDIR may be inherited from another user (a root
 # session running git as paul) and be unwritable; a scan that cannot write
@@ -99,7 +102,14 @@ report="$work/gitleaks.json"
 glog="$work/gitleaks.log"
 added="$work/added.tsv"
 
-patch() { printf '%s\n' "$commits" | git log --no-walk=unsorted --stdin -p --no-color --format='commit %H%n%B'; }
+# A merge is read against its first parent. git log -p shows a merge no diff
+# at all, so text the merge itself adds (a conflict resolution, or anything
+# neither parent has) would otherwise reach no scan.
+MERGES=--diff-merges=first-parent
+# git log --stdin with no input falls back to HEAD: give it only real lists.
+outgoing() { [ -n "$commits" ] || return 0; printf '%s\n' "$commits" | git log --no-walk=unsorted --stdin "$@"; }
+tagtext() { local t; for t in "${tags[@]}"; do printf 'tag %s\n' "$t"; git cat-file tag "$t" | sed '1,/^$/d'; done; }
+patch() { outgoing -p "$MERGES" --no-color --format='commit %H%n%B' && tagtext; }
 
 # ---- 3. Known credentials, by value (root scanner over a socket) ---------
 scan=$(patch | python3 -c '
@@ -128,25 +138,62 @@ fi
 # "${revs[*]}" joins with single spaces. A trailing space made gitleaks hand
 # git an empty argument, scan 0 commits and report "no leaks found" with exit
 # 0, so the number of commits it scanned is checked as well as its verdict.
-if ! gitleaks git --no-banner --redact=100 --ignore-gitleaks-allow --max-decode-depth 0 \
-     --log-opts="${revs[*]}" -f json -r "$report" . >/dev/null 2>"$glog"; then
-  if [ -s "$report" ] && jq -e 'length > 0' "$report" >/dev/null 2>&1; then
-    while IFS= read -r line; do problems+=("gitleaks: ${line}"); done < <(jq -r '.[] | "\(.RuleID) in \(.File) (commit \(.Commit[0:8]))"' "$report" | sort -u | head -20)
-  else
-    problems+=("gitleaks could not scan the outgoing commits; refusing rather than skipping it")
+if [ -n "$commits" ]; then
+  if ! gitleaks git --no-banner --redact=100 --ignore-gitleaks-allow --max-decode-depth 0 \
+       --log-opts="$MERGES ${revs[*]}" -f json -r "$report" . >/dev/null 2>"$glog"; then
+    if [ -s "$report" ] && jq -e 'length > 0' "$report" >/dev/null 2>&1; then
+      while IFS= read -r line; do problems+=("gitleaks: ${line}"); done < <(jq -r '.[] | "\(.RuleID) in \(.File) (commit \(.Commit[0:8]))"' "$report" | sort -u | head -20)
+    else
+      problems+=("gitleaks could not scan the outgoing commits; refusing rather than skipping it")
+    fi
+  fi
+  # gitleaks counts only the commits that give it text to scan: a file that
+  # is not binary and not deleted, with at least one hunk. An empty commit,
+  # or one that only deletes, renames, or changes a mode or a binary, has
+  # none. The count it must reach is worked out the same way, from the diff
+  # git gives gitleaks.
+  outgoing -p -U0 "$MERGES" --no-color --format='commit %H' > "$work/u0.patch" ||
+    problems+=("could not read the outgoing changes; refusing")
+  want=$(awk '
+    function done_file() { if (infile && hunk && !del && !bin) has[c] = 1; infile = 0 }
+    /^commit [0-9a-f]+$/ { done_file(); c = $2; next }
+    /^diff --git / { done_file(); infile = 1; hunk = 0; del = 0; bin = 0; next }
+    infile && /^deleted file mode / { del = 1; next }
+    infile && /^Binary files .* differ$/ { bin = 1; next }
+    infile && /^@@ / { hunk = 1; next }
+    END { done_file(); k = 0; for (x in has) k++; print k }' "$work/u0.patch")
+  scanned=$(/usr/bin/grep -oE '[0-9]+ commits scanned' "$glog" | /usr/bin/grep -oE '^[0-9]+' | tail -1)
+  if [ "${scanned:-0}" -lt "${want:-$n}" ]; then
+    problems+=("gitleaks scanned ${scanned:-0} of the ${want:-$n} outgoing commit(s) with text to scan; refusing rather than trusting a partial scan")
   fi
 fi
-scanned=$(/usr/bin/grep -oE '[0-9]+ commits scanned' "$glog" | /usr/bin/grep -oE '^[0-9]+' | tail -1)
-if [ "${scanned:-0}" -lt "$n" ]; then
-  problems+=("gitleaks scanned ${scanned:-0} of ${n} outgoing commit(s); refusing rather than trusting a partial scan")
+# gitleaks git reads diffs, never messages: commit and tag messages are
+# scanned as text, and the bytes it read are checked like the commit count.
+{ outgoing --format='commit %H%n%B' && tagtext; } > "$work/text.txt" ||
+  problems+=("could not read the outgoing messages; refusing")
+if ! gitleaks stdin --no-banner --redact=100 --ignore-gitleaks-allow --max-decode-depth 0 \
+     -f json -r "$work/text.json" < "$work/text.txt" >/dev/null 2>"$work/text.log"; then
+  if [ -s "$work/text.json" ] && jq -e 'length > 0' "$work/text.json" >/dev/null 2>&1; then
+    while IFS= read -r line; do problems+=("gitleaks: ${line}"); done < <(
+      jq -r '.[] | "\(.RuleID)\t\(.StartLine)"' "$work/text.json" | while IFS=$'\t' read -r rule ln; do
+        printf '%s in the message of %s\n' "$rule" "$(awk -v n="$ln" '/^(commit|tag) [0-9a-f]+$/ { w = $1 " " substr($2, 1, 8) } NR == n { print w; exit }' "$work/text.txt")"
+      done | sort -u | head -20)
+  else
+    problems+=("gitleaks could not scan the messages; refusing rather than skipping it")
+  fi
+fi
+read_bytes=$(/usr/bin/grep -oE 'scanned ~?[0-9]+ bytes' "$work/text.log" | /usr/bin/grep -oE '[0-9]+' | tail -1)
+if [ "${read_bytes:-0}" -lt "$(wc -c < "$work/text.txt")" ]; then
+  problems+=("gitleaks read ${read_bytes:-0} of $(wc -c < "$work/text.txt") bytes of the messages; refusing rather than trusting a partial scan")
 fi
 
 # ---- 5. Credential-shaped files added ------------------------------------
+# Without renames, a file moved to a credential-shaped name counts as added.
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   case "$f" in *.example | *.sample | *.template | *.pub | *.dist) continue ;; esac
   problems+=("credential-shaped file added: ${f}")
-done < <(printf '%s\n' "$commits" | git log --no-walk=unsorted --stdin --diff-filter=A --name-only --format='' |
+done < <(outgoing --diff-filter=A --no-renames "$MERGES" --name-only --format='' |
   /usr/bin/grep -E '(^|/)(\.env(\.[A-Za-z0-9_-]+)?|id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|sqlite3?|db))$' | sort -u)
 
 # ---- 6. Things that must never be public ---------------------------------
@@ -157,14 +204,19 @@ if [ "$visibility" = public ]; then
     allowed=""
     [ -r "$ALLOW" ] && allowed=$(awk -v s="$slug" -F'\t' '$1 == s {print $2}' "$ALLOW")
     # One row per added line or message line: commit, file, text.
-    for c in $commits; do
-      git show --no-color --unified=0 --format='%B' "$c" | awk -v c="${c:0:8}" '
-        BEGIN { f = "(commit message)"; inmsg = 1 }
-        /^diff --git / { inmsg = 0; next }
-        /^\+\+\+ / { f = substr($0, 5); sub(/^b\//, "", f); next }
-        inmsg { print c "\t" f "\t" $0; next }
-        /^\+/ { print c "\t" f "\t" substr($0, 2) }'
-    done > "$added" || problems+=("could not collect the added lines; refusing")
+    {
+      for c in $commits; do
+        git show --no-color --unified=0 "$MERGES" --format='%B' "$c" | awk -v c="${c:0:8}" '
+          BEGIN { f = "(commit message)"; inmsg = 1 }
+          /^diff --git / { inmsg = 0; next }
+          /^\+\+\+ / { f = substr($0, 5); sub(/^b\//, "", f); next }
+          inmsg { print c "\t" f "\t" $0; next }
+          /^\+/ { print c "\t" f "\t" substr($0, 2) }'
+      done
+      for t in "${tags[@]}"; do
+        git cat-file tag "$t" | sed '1,/^$/d' | awk -v c="${t:0:8}" '{ print c "\t(tag message)\t" $0 }'
+      done
+    } > "$added" || problems+=("could not collect the added lines; refusing")
     [ -f "$added" ] || problems+=("could not collect the added lines; refusing")
     while IFS=$'\t' read -r label re; do
       [ -z "$label" ] || [[ "$label" == \#* ]] && continue
@@ -180,5 +232,5 @@ if [ "$visibility" = public ]; then
 fi
 
 [ ${#problems[@]} -gt 0 ] && refuse
-say "ok: ${n} commit(s), ${visibility}, no known credentials, no gitleaks findings$([ "$visibility" = public ] && printf ', no denylisted content')"
+say "ok: ${n} commit(s)$([ ${#tags[@]} -gt 0 ] && printf ' and %d tag(s)' ${#tags[@]}), ${visibility}, no known credentials, no gitleaks findings$([ "$visibility" = public ] && printf ', no denylisted content')"
 exit 0
