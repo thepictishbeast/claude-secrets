@@ -36,6 +36,9 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$T/lab/scan.sock" ] && break; sleep 0.2;
 # tests are published, so they must not contain what the real list protects.
 printf 'lab-phone\t212[^0-9]{0,3}555[^0-9]{0,3}0199\nlab-name\t\\b[Zz]ebulon\\b\nlab-subnet\t\\b10\\.77\\.[0-9]{1,3}\\.[0-9]{1,3}\\b\n' > "$T/lab/denylist"
 
+# A lab allow list of public destinations, filled in by new_repo.
+: > "$T/lab/allow"
+
 # A work repo whose hooks are the dispatcher, as the system-wide install
 # would make them, but set locally so this test does not depend on it.
 mkdir -p "$T/hooks"; cp "$here/hook-dispatch" "$T/hooks/hook-dispatch"
@@ -47,7 +50,17 @@ new_repo() { # name visibility(private|public)
   git -C "$T/$1" config user.name test; git -C "$T/$1" config user.email test@example.com
   git -C "$T/$1" config push-guard.socket "$T/lab/scan.sock"
   git -C "$T/$1" config push-guard.denylist "$T/lab/denylist"
-  [ "$2" = public ] && git -C "$T/$1" config push-guard.visibility public
+  # A local remote may name a lab allow list, so the tests never need an entry
+  # in the real one. `unlisted` is public and deliberately absent from it.
+  case "$2" in
+    public)
+      git -C "$T/$1" config push-guard.visibility public
+      git -C "$T/$1" config push-guard.allowfile "$T/lab/allow"
+      printf '%s\n' "$T/$1-remote.git" >> "$T/lab/allow" ;;
+    unlisted)
+      git -C "$T/$1" config push-guard.visibility public
+      git -C "$T/$1" config push-guard.allowfile "$T/lab/allow" ;;
+  esac
   git -C "$T/$1" remote add origin "$T/$1-remote.git"
   echo base > "$T/$1/README"; git -C "$T/$1" add README; git -C "$T/$1" commit -qm base
 }
@@ -66,6 +79,30 @@ expect_allowed() {
 
 new_repo clean private; commit clean a.txt "ordinary change"; expect_allowed clean "private push of ordinary work is allowed"
 new_repo pubclean public; commit pubclean a.txt "call 212-555-0142"; expect_allowed pubclean "public push of data not on the denylist is allowed"
+
+# A public destination has to be on the allow list. The content here is clean,
+# so only the destination can refuse it.
+new_repo unlisted unlisted; commit unlisted a.txt "ordinary work"
+expect_refused unlisted "is not listed in" "public: a destination not on the allow list is refused even with clean content"
+# Fail closed: with no allow list at all, nothing may be published.
+new_repo noallow unlisted; git -C "$T/noallow" config push-guard.allowfile "$T/lab/missing-allow"
+commit noallow a.txt "ordinary work"
+expect_refused noallow "cannot read" "fail closed: an unreadable allow list refuses every public push"
+
+# A licence carrying a patent grant reaches every recipient and cannot be
+# taken back, so it is Paul's decision whichever way the repository goes.
+apache="Apache License Version 2.0
+
+3. Grant of Patent License. Subject to the terms of this License, each
+Contributor hereby grants to You a perpetual, worldwide, royalty-free,
+irrevocable patent license."
+new_repo lic private; commit lic LICENSE "$apache"
+expect_refused lic "patent grant added or changed" "any: adding a licence with a patent grant is refused, even private"
+new_repo licmit private; commit licmit LICENSE "MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software, to deal in the Software without restriction."
+expect_allowed licmit "a licence with no patent grant is allowed"
 new_repo phone public; commit phone a.txt "call me at (212) 555-0199"; expect_refused phone lab-phone "public: a denylisted phone number in an added line is refused"
 new_repo name public; commit name a.txt "fine" "reply to Zebulon"; expect_refused name lab-name "public: a denylisted name in a commit message is refused"
 new_repo vpn public; commit vpn wg.conf "AllowedIPs = 10.77.0.4/32"; expect_refused vpn lab-subnet "public: a denylisted subnet is refused"
@@ -149,11 +186,17 @@ expect_refused renv "credential-shaped file added: .env" "any: a file renamed to
 # denylist read an empty file and pass).
 P=$(mktemp -d /tank/scratch/push-guard-paul.XXXXXX); chown paul "$P"
 cp "$T/lab/denylist" "$P/denylist"; chown paul "$P/denylist"
+: > "$P/allow"; chown paul "$P/allow"
 as_paul_push() { # name visibility content
+  # The destination has to be on an allow list before anything else is
+  # checked, so each of these repos lists its own remote: what is under test
+  # here is the scan, not the destination.
+  printf '../%s-remote.git\n' "$1" >> "$P/allow"
   runuser -u paul -- env TMPDIR=/root/.push-guard-no-access bash -c '
     set -e; cd "$1"; git init -q --bare "$2-remote.git"; git init -q -b main "$2"; cd "$2"
     git config core.hooksPath "$3"; git config user.name t; git config user.email t@example.com
     git config push-guard.denylist "$1/denylist"; git config push-guard.visibility "$4"
+    git config push-guard.allowfile "$1/allow"
     git remote add origin "../$2-remote.git"; echo base > README; git add README; git commit -qm base
     printf "%s\n" "$5" > a.txt; git add a.txt; git commit -qm change
     git push -q origin main' _ "$P" "$1" "$T/hooks" "$2" "$3" 2>"$P/$1.err"
@@ -193,7 +236,18 @@ deny_case "gh repo edit thepictishbeast/x --visibility public --accept-visibilit
 deny_case "gh api -X PATCH repos/thepictishbeast/x -F private=false"
 deny_case "gh gist create --public notes.md"
 deny_case "gh api -X PUT repos/thepictishbeast/x/contents/a.md -f message=m -f content=Zm9v"
+deny_case "gh release create v1 -R thepictishbeast/not-an-allowed-repo dist/app.apk"
+deny_case "cargo publish"
+deny_case "npm publish --access public"
+deny_case "twine upload dist/*"
+deny_case "echo x >> /etc/claude-secrets/public-push-allow"
+deny_case "tee /etc/claude-secrets/public-push-allow"
+deny_case "sed -i s/a/b/ /etc/claude-secrets/public-denylist"
+deny_case "rm /etc/claude-secrets/*"
 allow_case "git push origin main"
+allow_case "cargo publish --dry-run"
+allow_case "cp /etc/claude-secrets/public-denylist /tmp/copy-for-reading"
+allow_case "gh release list -R thepictishbeast/Tempered-Studio"
 allow_case "runuser -u paul -- git -c credential.helper= push -q origin main"
 allow_case "gh repo create thepictishbeast/x --private"
 allow_case "gh api repos/thepictishbeast/x --jq .private"

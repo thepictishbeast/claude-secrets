@@ -8,6 +8,10 @@
 #     GIT_CONFIG_* environment forms, and shell writes to git config files
 #   - creating a public repo, making a repo public, a public gist, or writing
 #     files through the GitHub contents API (commits that bypass git hooks)
+#   - writing the guard's own configuration under /etc/claude-secrets, which
+#     includes the list of repositories a public push is allowed to
+#   - publishing by a route no git hook sees: a GitHub release on a repository
+#     that is not on that list, or cargo/npm/twine publish
 # Each of these is Paul's decision: the session is told to ask him.
 #
 # It matches command text, so it is a tripwire rather than a wall; see the
@@ -15,15 +19,34 @@
 set -uo pipefail
 # The command is split into words below; never let this shell expand them.
 set -f
-cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null)
-[ -z "$cmd" ] && exit 0
+input=$(cat)
+cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
+# Where the command will run, for resolving a repository from its remote.
+cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
+ALLOW_PUBLIC=/etc/claude-secrets/public-push-allow
 
 deny() {
   jq -cn --arg r "push-guard: $1 Ask Paul; he can do it himself if he wants it." \
     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
   exit 0
 }
+
+# The file-editing tools reach the guard's configuration without a shell, so
+# the command checks below would never see them. Registered for Write|Edit as
+# well as Bash for exactly this.
+case "$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty' 2>/dev/null)" in
+  /etc/claude-secrets | /etc/claude-secrets/*)
+    deny "writing the push guard's own configuration would let this session allow its own public push." ;;
+esac
+[ -z "$cmd" ] && exit 0
 has() { printf '%s' "$2" | /usr/bin/grep -qiE -- "$1"; }
+# Is this repository one Paul has already listed as a public destination?
+# Same file and same reading as git-push-guard, so one list governs both.
+public_allowed() {
+  [ -r "$ALLOW_PUBLIC" ] || return 1
+  sed -E 's/#.*//; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' "$ALLOW_PUBLIC" |
+    tr 'A-Z' 'a-z' | /usr/bin/grep -qxF "$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+}
 
 # Quotes and backslashes removed, so "git", 'git' and \git all read as git.
 norm=$(printf '%s' "$cmd" | tr -d "\"'\\\\" | tr '\t' ' ')
@@ -166,6 +189,15 @@ while IFS= read -r seg; do
   # and a wildcard that is only read cannot replace a config.
   if has "$WRITE_CMD" "$seg"; then
     while IFS= read -r w; do
+      # The guard's own configuration: the public-push allow list, the
+      # denylist and the credential dictionaries. A session that can write
+      # these can allow its own public push, so writing them is Paul's
+      # decision. The pattern matches a wildcard argument as well, since the
+      # literal `*` it would expand is matched here too.
+      case "$w" in
+        /etc/claude-secrets | /etc/claude-secrets/*)
+          deny "writing the push guard's own configuration would let this session allow its own public push." ;;
+      esac
       case "$w" in *[*?[]*) ;; *) continue ;; esac
       [[ $UNQUOTED == *"$w"* ]] || continue
       for c in "${CONF_PATHS[@]}"; do
@@ -200,6 +232,33 @@ while IFS= read -r seg; do
       has '(^| )/?repos/[^/ ]+/[^/ ?]+/?( |$)' "$seg" && has '(\$|`|(^| )--input( |=))' "$seg" &&
         deny "repository settings changed with fields built at run time can't be checked; write the fields out."
     fi
+    # A release publishes files and notes on a repository that is already
+    # public, so no push happens and the pre-push guard never sees it. It is
+    # allowed only where Paul has already accepted that the repository is a
+    # public destination — which is how the APK release flow keeps working.
+    if has '(^| )release +(create|upload|edit)( |$)' "$seg"; then
+      rslug=$(printf '%s' "$seg" | /usr/bin/grep -oE '(-R|--repo)[= ]+[^ ]+' | head -1 |
+        sed -E 's/^(-R|--repo)[= ]+//')
+      [ -z "$rslug" ] && rslug=$(git -C "${cwd:-.}" remote get-url origin 2>/dev/null |
+        sed -E 's#^.*github\.com[:/]+##; s#\.git/?$##; s#/+$##')
+      if [ -z "$rslug" ]; then
+        deny "a release publishes files outside the push guard, and this one's repository could not be read from -R or the remote."
+      elif ! public_allowed "$rslug"; then
+        deny "publishing a release on ${rslug} is Paul's decision: it is not listed in ${ALLOW_PUBLIC}."
+      fi
+    fi
   fi
+
+  # Package registries: an upload that no git hook sees and that cannot be
+  # withdrawn once the index has it. `--dry-run` only builds and reports, so
+  # it is left alone.
+  if has "${B}cargo( +[^;&|]*)? publish( |$)" "$seg" && ! has '(^| )--dry-run( |$)' "$seg"; then
+    deny "cargo publish uploads this crate's full source to crates.io, and a published version cannot be withdrawn."
+  fi
+  if has "${B}npm( +[^;&|]*)? publish( |$)" "$seg" && ! has '(^| )--dry-run( |$)' "$seg"; then
+    deny "npm publish makes this package public."
+  fi
+  has "${B}twine +upload( |$)" "$seg" &&
+    deny "twine upload publishes this package to PyPI."
 done < <(printf '%s\n' "$norm" | tr ';&|(){}\n' '\n\n\n\n\n\n\n' | tr -s ' ')
 exit 0

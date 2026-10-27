@@ -25,7 +25,8 @@ systemctl enable --now push-scan.socket
 
 # The denylist and allowlist are Paul's to edit; paul-group read so paul's
 # pushes can be checked too. Created empty if missing, never overwritten.
-for f in /etc/claude-secrets/public-denylist /etc/claude-secrets/push-allow; do
+for f in /etc/claude-secrets/public-denylist /etc/claude-secrets/push-allow \
+         /etc/claude-secrets/public-push-allow; do
   [ -e "$f" ] || install -m 640 /dev/null "$f"
   chown root:paul "$f"; chmod 640 "$f"
 done

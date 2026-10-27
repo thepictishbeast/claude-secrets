@@ -10,9 +10,17 @@
 #   - anything gitleaks recognises
 #   - a newly added credential-shaped file (.env, private keys, keystores,
 #     databases)
-# A push to a PUBLIC repository is also refused if an added line or a commit
-# message matches /etc/claude-secrets/public-denylist (personal data,
-# internal addresses, credential locations).
+# A push to a PUBLIC repository is refused unless the destination is listed in
+# /etc/claude-secrets/public-push-allow. Publishing is a judgement the scans
+# cannot make and a wrong guess is permanent, so an unlisted public
+# destination is refused rather than guessed at. It is also refused if an
+# added line or a commit message matches /etc/claude-secrets/public-denylist
+# (personal data, internal addresses, credential locations).
+#
+# Any push, public or private, is refused if it adds or changes a licence file
+# carrying an express patent grant (Apache-2.0 s3, GPL/AGPL-3.0 s11, MPL-2.0
+# s2.1, FSL Patents), because that grant reaches every recipient and cannot be
+# withdrawn later.
 #
 # Visibility comes from the GitHub API. If it cannot be confirmed, the push
 # is refused: an unknown answer is treated as public and unsafe.
@@ -26,15 +34,20 @@ remote="${1:-}"
 url="${2:-}"
 DENYLIST=/etc/claude-secrets/public-denylist
 ALLOW=/etc/claude-secrets/push-allow
+ALLOW_PUBLIC=/etc/claude-secrets/public-push-allow
 SOCKET=/run/push-scan.sock
 ZERO=0000000000000000000000000000000000000000
 problems=()
+# What to do about a refusal. Rewriting commits is the answer for content the
+# scans caught; it is no answer at all when the destination itself is the
+# problem, so that case replaces this.
+fix_hint="Fix the commits (rewrite them if they are unpushed), then push again."
 
 say() { printf 'push-guard: %s\n' "$*" >&2; }
 refuse() {
   say "REFUSED push to ${url}"
   for p in "${problems[@]}"; do say "  - $p"; done
-  say "Fix the commits (rewrite them if they are unpushed), then push again."
+  say "$fix_hint"
   exit 1
 }
 
@@ -63,12 +76,59 @@ case "$url" in
     # leaves this machine can use these.
     lab_socket=$(git config --get push-guard.socket 2>/dev/null) && SOCKET="$lab_socket"
     lab_deny=$(git config --get push-guard.denylist 2>/dev/null) && DENYLIST="$lab_deny"
+    lab_allow=$(git config --get push-guard.allowfile 2>/dev/null) && ALLOW_PUBLIC="$lab_allow"
     ;;
   *)
     # Any other host: its visibility cannot be checked, so scan as public.
     visibility=public
     ;;
 esac
+
+# Files a licence lives in, and the clauses that give away patent rights.
+LICENSE_FILES='(^|/)(LICEN[SC]E|COPYING)([.-][A-Za-z0-9._-]+)?$'
+# Which patent grant, if any, a licence text carries. Printed in a refusal so
+# the cost of allowing a push is visible, never guessed at.
+patent_grant() {
+  local t=$1
+  printf '%s' "$t" | /usr/bin/grep -qiE 'Grant of Patent License' && { echo 'Apache-2.0 section 3'; return; }
+  printf '%s' "$t" | /usr/bin/grep -qiE '^ *11\. *Patents' && { echo 'GPL/AGPL-3.0 section 11'; return; }
+  printf '%s' "$t" | /usr/bin/grep -qiE 'under (its )?Patent Claims' && { echo 'MPL-2.0 section 2.1'; return; }
+  printf '%s' "$t" | /usr/bin/grep -qiE '^#+ *Patents? *$' && { echo 'FSL Patents section'; return; }
+  return 1
+}
+# The grant carried by the licence files already committed at HEAD.
+head_grant() {
+  local f t g
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    t=$(git show "HEAD:$f" 2>/dev/null) || continue
+    g=$(patent_grant "$t") && { printf '%s in %s' "$g" "$f"; return 0; }
+  done < <(git ls-tree -r --name-only HEAD 2>/dev/null | /usr/bin/grep -E "$LICENSE_FILES")
+  return 1
+}
+
+# ---- 1b. A public destination needs an explicit allowance -----------------
+# The scans below answer whether this content is a secret. They cannot answer
+# whether it should be published at all — that is a judgement about what is
+# worth keeping unpublished, and a wrong guess is permanent: a public push
+# ends patent rights in Europe and China the day it lands and starts a
+# one-year US clock. So it is not guessed. A public destination must be named
+# in a file only a person edits, and the push is refused otherwise.
+if [ "$visibility" = public ]; then
+  dest=$(printf '%s' "${slug:-$url}" | tr 'A-Z' 'a-z')
+  if [ ! -r "$ALLOW_PUBLIC" ]; then
+    problems+=("cannot read ${ALLOW_PUBLIC}, so no public push can be allowed; refusing")
+    refuse
+  fi
+  if ! sed -E 's/#.*//; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' "$ALLOW_PUBLIC" |
+       tr 'A-Z' 'a-z' | /usr/bin/grep -qxF "$dest"; then
+    problems+=("${dest} is PUBLIC and is not listed in ${ALLOW_PUBLIC}")
+    problems+=("a public push is permanent: it ends European and Chinese patent rights in what it discloses that same day, and starts a one-year US clock")
+    g=$(head_grant) && problems+=("this repository's licence also grants every recipient a patent licence (${g})")
+    fix_hint="Nothing in the commits is wrong: the destination is. Push somewhere private, or ask Paul."
+    refuse
+  fi
+fi
 
 # ---- 2. Which commits are leaving? ----------------------------------------
 revs=()
@@ -230,6 +290,21 @@ if [ "$visibility" = public ]; then
     done < "$DENYLIST"
   fi
 fi
+
+# ---- 7. A licence that gives patent rights away --------------------------
+# Adding or changing a licence carrying an express patent grant hands every
+# recipient a licence to the patents covering that code, and it cannot be
+# taken back from anyone who already holds a copy. Making the repository
+# private afterwards does not undo it. Whatever the destination's visibility,
+# that is a person's decision, so this refuses a private push too.
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  addedtext=$(outgoing -p "$MERGES" --no-color --format='' -- "$f" |
+    /usr/bin/grep '^+' | /usr/bin/grep -v '^+++' | sed 's/^+//')
+  g=$(patent_grant "$addedtext") &&
+    problems+=("licence carrying a patent grant added or changed: ${f} (${g}) — this gives every recipient a patent licence, irrevocably")
+done < <(outgoing --diff-filter=AM "$MERGES" --name-only --format='' |
+  /usr/bin/grep -E "$LICENSE_FILES" | sort -u)
 
 [ ${#problems[@]} -gt 0 ] && refuse
 say "ok: ${n} commit(s)$([ ${#tags[@]} -gt 0 ] && printf ' and %d tag(s)' ${#tags[@]}), ${visibility}, no known credentials, no gitleaks findings$([ "$visibility" = public ] && printf ', no denylisted content')"
