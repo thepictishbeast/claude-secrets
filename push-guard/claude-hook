@@ -21,8 +21,6 @@ set -uo pipefail
 set -f
 input=$(cat)
 cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
-# Where the command will run, for resolving a repository from its remote.
-cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
 ALLOW_PUBLIC=/etc/claude-secrets/public-push-allow
 
 deny() {
@@ -237,12 +235,14 @@ while IFS= read -r seg; do
     # allowed only where Paul has already accepted that the repository is a
     # public destination — which is how the APK release flow keeps working.
     if has '(^| )release +(create|upload|edit)( |$)' "$seg"; then
+      # The repository has to come from the command, never from the working
+      # directory. The hook sees the session's cwd as it was when the hook
+      # ran, so `cd somewhere-else && gh release create` would be checked
+      # against the wrong repository and published to the right one.
       rslug=$(printf '%s' "$seg" | /usr/bin/grep -oE '(-R|--repo)[= ]+[^ ]+' | head -1 |
         sed -E 's/^(-R|--repo)[= ]+//')
-      [ -z "$rslug" ] && rslug=$(git -C "${cwd:-.}" remote get-url origin 2>/dev/null |
-        sed -E 's#^.*github\.com[:/]+##; s#\.git/?$##; s#/+$##')
       if [ -z "$rslug" ]; then
-        deny "a release publishes files outside the push guard, and this one's repository could not be read from -R or the remote."
+        deny "name the repository with -R: a release publishes files outside the push guard, and which repository it lands on cannot be read from the working directory."
       elif ! public_allowed "$rslug"; then
         deny "publishing a release on ${rslug} is Paul's decision: it is not listed in ${ALLOW_PUBLIC}."
       fi

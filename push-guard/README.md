@@ -100,7 +100,13 @@ Known limits.
     boundary;
   - `HOME=` or `XDG_CONFIG_HOME=` pointing git at a prepared global config;
   - shell tools other than Bash, such as an MCP server's command runner,
-    because the hook's matcher is `Bash`.
+    because the hook's matcher is `Bash`, `Write`, `Edit` and `MultiEdit`
+    and nothing else.
+
+  A release must name its repository with `-R`. The hook sees the session's
+  working directory as it was when the hook ran, so `cd elsewhere && gh
+  release create` would be checked against one repository and published to
+  another; requiring `-R` removes the question.
 
   Stopping those would take file permissions, not pattern matching. The git
   pre-push hook still runs in every one of these cases unless the system

@@ -297,13 +297,16 @@ fi
 # taken back from anyone who already holds a copy. Making the repository
 # private afterwards does not undo it. Whatever the destination's visibility,
 # that is a person's decision, so this refuses a private push too.
+# Without --no-renames a licence moved into place (LICENSE.md -> LICENSE)
+# shows as a rename with no added lines, so the grant it carries would reach
+# no check. The same reason §5 uses it.
 while IFS= read -r f; do
   [ -z "$f" ] && continue
-  addedtext=$(outgoing -p "$MERGES" --no-color --format='' -- "$f" |
+  addedtext=$(outgoing -p --no-renames "$MERGES" --no-color --format='' -- "$f" |
     /usr/bin/grep '^+' | /usr/bin/grep -v '^+++' | sed 's/^+//')
   g=$(patent_grant "$addedtext") &&
     problems+=("licence carrying a patent grant added or changed: ${f} (${g}) — this gives every recipient a patent licence, irrevocably")
-done < <(outgoing --diff-filter=AM "$MERGES" --name-only --format='' |
+done < <(outgoing --diff-filter=AM --no-renames "$MERGES" --name-only --format='' |
   /usr/bin/grep -E "$LICENSE_FILES" | sort -u)
 
 [ ${#problems[@]} -gt 0 ] && refuse
